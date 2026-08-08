@@ -1,0 +1,29 @@
+# ---- 构建产物 ----
+/investhub
+/investhub-*
+*.exe
+
+# 前端构建产物（由 `npm run build` 生成后嵌入 Go 二进制）
+/internal/web/dist/*
+!/internal/web/dist/.gitkeep
+
+# ---- 依赖 ----
+node_modules/
+
+# ---- 运行时数据（含私钥，切勿提交）----
+/data/
+*.db
+*.db-shm
+*.db-wal
+master.key
+
+# ---- 本地导出 ----
+*.backup.json
+investhub-export-*.csv
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
