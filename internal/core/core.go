@@ -5,6 +5,7 @@ package core
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"math/rand"
 	"strconv"
@@ -116,8 +117,12 @@ func decorate(a *assetRow) Asset {
 		health = "disabled"
 	case q == nil:
 		health = "stale"
-	case q.Status == "ok" || q.Status == "sim":
+	case q.Status == "ok":
 		health = "ok"
+	case q.Status == "sim":
+		health = "sim"
+	case q.Status == "nosource":
+		health = "nosource"
 	default:
 		health = "stale"
 	}
@@ -192,7 +197,7 @@ func defaultCurrency(cat string) string {
 func defaultProvider(cat string) string {
 	switch cat {
 	case "crypto":
-		return "coingecko"
+		return "binance"
 	case "fund":
 		return "fund_eastmoney"
 	case "gold":
@@ -769,7 +774,13 @@ func CreateTransaction(in TxInput) (map[string]any, error) {
 	if err != nil {
 		return nil, errf(50001, err.Error())
 	}
-	return map[string]any{"id": id}, nil
+	warning := ""
+	if q := quotes.Get(in.AssetID); q != nil && q.Status == "ok" && q.Price > 0 {
+		if dev := math.Abs(*in.Price-q.Price) / q.Price; dev > 0.5 {
+			warning = fmt.Sprintf("成交价 %.4g 与当前行情 %.4g 偏离 %.0f%%，请确认是否为历史交易补录", *in.Price, q.Price, dev*100)
+		}
+	}
+	return map[string]any{"id": id, "warning": warning}, nil
 }
 
 // TxQuery filters a transaction listing.

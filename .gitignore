@@ -27,3 +27,8 @@ investhub-export-*.csv
 .vscode/
 *.swp
 *.log
+
+deliverables/
+
+# ---- 助手工作记忆（非项目源码）----
+.workbuddy/

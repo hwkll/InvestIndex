@@ -4,8 +4,8 @@ package quotes
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"investhub/internal/cryptox"
@@ -45,6 +46,7 @@ type Asset struct {
 	ID       string
 	Category string
 	Symbol   string
+	SubType  string
 	Currency string
 	Provider string
 }
@@ -122,7 +124,7 @@ func DefaultPrice(a Asset) float64 {
 }
 
 func activeAssets() []Asset {
-	rows, err := store.Query(`SELECT id, category, symbol, currency, provider FROM assets WHERE status='active' ORDER BY category`)
+	rows, err := store.Query(`SELECT id, category, symbol, sub_type, currency, provider FROM assets WHERE status='active' ORDER BY category`)
 	if err != nil {
 		return nil
 	}
@@ -130,7 +132,20 @@ func activeAssets() []Asset {
 	var out []Asset
 	for rows.Next() {
 		var a Asset
-		if err := rows.Scan(&a.ID, &a.Category, &a.Symbol, &a.Currency, &a.Provider); err == nil {
+		// Scan nullable columns into pointers: a NULL sub_type/provider (e.g.
+		// crypto/stock seeds) would otherwise make rows.Scan fail and silently
+		// drop the asset from polling.
+		var subType, currency, provider *string
+		if err := rows.Scan(&a.ID, &a.Category, &a.Symbol, &subType, &currency, &provider); err == nil {
+			if subType != nil {
+				a.SubType = *subType
+			}
+			if currency != nil {
+				a.Currency = *currency
+			}
+			if provider != nil {
+				a.Provider = *provider
+			}
 			out = append(out, a)
 		}
 	}
@@ -171,8 +186,17 @@ func SeedState() {
 	}
 }
 
-// AddAsset registers a freshly created asset with the quote layer.
+// AddAsset registers a freshly created asset with the quote layer. It seeds a
+// simulator quote so the asset is never "unknown"; the API handler is
+// responsible for pulling a real quote (and backfilling K-line) right after
+// creation. Idempotent: re-adding an existing asset is a no-op.
 func AddAsset(a Asset) {
+	mu.RLock()
+	if _, exists := cache[a.ID]; exists {
+		mu.RUnlock()
+		return
+	}
+	mu.RUnlock()
 	price := DefaultPrice(a)
 	vol := simVol[a.Category]
 	if vol == 0 {
@@ -187,7 +211,6 @@ func AddAsset(a Asset) {
 		SourceTime: time.Now().UnixMilli(), Status: "sim",
 	}
 	mu.Unlock()
-	EnsureKline(a, "1d", 200)
 }
 
 // Get returns the cached quote for an asset (nil when unknown).
@@ -204,30 +227,63 @@ func Get(assetID string) *Quote {
 
 // ---- real providers -----------------------------------------------------
 
-var coingeckoIDs = map[string]string{
-	"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin",
-	"XRP": "ripple", "DOGE": "dogecoin", "ADA": "cardano", "AVAX": "avalanche-2",
-	"DOT": "polkadot", "LINK": "chainlink", "TON": "the-open-network", "TRX": "tron",
+// fetchReal tries the configured provider; returns nil on any failure.
+// srcFailTotal counts failed real-source fetches, surfaced via SourceFailTotal
+// so operators can observe upstream data health.
+var srcFailTotal int64
+
+// HasProvider reports whether the asset maps to a real upstream data source.
+// Crypto (Binance), on-exchange ETFs (Sina), off-exchange funds (Eastmoney net
+// value) and SGE spot gold all have a source. When a source is configured but
+// temporarily unreachable (e.g. off-exchange fund NAV endpoint down), the
+// caller falls back to "nosource" rather than a fabricated simulator price.
+func HasProvider(a Asset) bool {
+	switch a.Category {
+	case "crypto":
+		return true // Binance USDT pairs cover the vast majority of tickers
+	case "fund", "stock", "gold":
+		return true
+	}
+	return false
 }
 
-// fetchReal tries the configured provider; returns nil on any failure.
 func fetchReal(a Asset) *Quote {
-	switch {
-	case a.Category == "crypto":
-		return fetchCoinGecko(a)
-	case a.Category == "stock" || a.Category == "fund" || a.Category == "gold":
+	switch a.Category {
+	case "crypto":
+		return fetchBinance(a)
+	case "stock":
+		return fetchSina(a)
+	case "fund":
+		if a.SubType == "etf" {
+			return fetchSina(a)
+		}
+		return fetchTiantian(a)
+	case "gold":
+		if isSpotGold(a) {
+			return fetchSinaSpot(a)
+		}
 		return fetchSina(a)
 	}
 	return nil
 }
 
-func fetchCoinGecko(a Asset) *Quote {
-	id, ok := coingeckoIDs[strings.ToUpper(a.Symbol)]
-	if !ok {
-		return nil
+// binanceSymbol maps our ticker convention (BTC, DOGE, SOL…) to a Binance USDT
+// spot pair. Binance has no USD/CNY pair, so crypto quotes stay in USD.
+func binanceSymbol(a Asset) string {
+	s := strings.ToUpper(strings.TrimSpace(a.Symbol))
+	if !strings.HasSuffix(s, "USDT") {
+		s += "USDT"
 	}
-	url := fmt.Sprintf("https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd&include_24hr_change=true", id)
-	resp, err := httpc.Get(url)
+	return s
+}
+
+// fetchBinance pulls the 24h ticker from Binance's public REST API (no key
+// required). Returns nil on any failure so the caller can fall back.
+func fetchBinance(a Asset) *Quote {
+	url := "https://api.binance.com/api/v3/ticker/24hr?symbol=" + binanceSymbol(a)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
 	if err != nil {
 		return nil
 	}
@@ -235,25 +291,127 @@ func fetchCoinGecko(a Asset) *Quote {
 	if resp.StatusCode != 200 {
 		return nil
 	}
-	var j map[string]map[string]float64
-	if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+	var j struct {
+		LastPrice          string `json:"lastPrice"`
+		PrevClosePrice     string `json:"prevClosePrice"`
+		PriceChangePercent string `json:"priceChangePercent"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&j); err != nil {
 		return nil
 	}
-	row, ok := j[id]
-	if !ok {
+	price, err := strconv.ParseFloat(j.LastPrice, 64)
+	if err != nil || price <= 0 || math.IsNaN(price) {
 		return nil
 	}
-	price := row["usd"]
-	if price <= 0 || math.IsNaN(price) {
+	prev, _ := strconv.ParseFloat(j.PrevClosePrice, 64)
+	if prev <= 0 {
+		prev = price
+	}
+	chg, _ := strconv.ParseFloat(j.PriceChangePercent, 64)
+	return &Quote{AssetID: a.ID, Price: price, PrevClose: prev, ChgPct: chg,
+		Currency: "USD", SourceTime: time.Now().UnixMilli(), Status: "ok"}
+}
+
+// fetchTiantian pulls the latest unit NAV for an off-exchange (open-end) fund
+// from Eastmoney's public JSONP endpoint. NOTE: this endpoint was unreachable
+// from the build/sandbox environment during implementation (Eastmoney returns a
+// generic "page not found"); the off-exchange-fund path therefore falls through
+// to "nosource" rather than fabricating a price. Wire it in only once the
+// source is verified reachable in the target deployment.
+func fetchTiantian(a Asset) *Quote {
+	code := strings.TrimSpace(a.Symbol)
+	url := "http://fundgz.1234567.com.cn/js/" + code + ".js"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "http://fundgz.1234567.com.cn/")
+	resp, err := httpc.Do(req)
+	if err != nil {
 		return nil
 	}
-	chg := row["usd_24h_change"]
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return nil
+	}
+	s := string(raw)
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil
+	}
+	var j struct {
+		Dwjz  string `json:"dwjz"`  // 单位净值
+		Jzzzl string `json:"jzzzl"` // 日增长率 %
+	}
+	if err := json.Unmarshal([]byte(s[start:end+1]), &j); err != nil {
+		return nil
+	}
+	price, err := strconv.ParseFloat(j.Dwjz, 64)
+	if err != nil || price <= 0 || math.IsNaN(price) {
+		return nil
+	}
+	chg, _ := strconv.ParseFloat(j.Jzzzl, 64)
 	prev := price
 	if chg != 0 {
 		prev = price / (1 + chg/100)
 	}
 	return &Quote{AssetID: a.ID, Price: price, PrevClose: prev, ChgPct: chg,
-		Currency: "USD", SourceTime: time.Now().UnixMilli(), Status: "ok"}
+		Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: "ok"}
+}
+
+// isSpotGold reports whether a gold asset should use the SGE spot quote
+// (gds_AUTD, CNY/gram) instead of the on-exchange gold-ETF quote (Sina A-share).
+func isSpotGold(a Asset) bool {
+	if a.Category != "gold" {
+		return false
+	}
+	switch a.SubType {
+	case "spot", "xau", "sge", "autd":
+		return true
+	}
+	s := strings.ToUpper(strings.TrimSpace(a.Symbol))
+	return s == "XAU" || s == "AU9999" || s == "AU99.99" || strings.Contains(s, "XAU")
+}
+
+// fetchSinaSpot pulls the Shanghai Gold Exchange Au(T+D) quote from Sina, which
+// is quoted directly in CNY per gram (no USD→CNY conversion needed).
+func fetchSinaSpot(a Asset) *Quote {
+	req, _ := http.NewRequest("GET", "https://hq.sinajs.cn/?list=gds_AUTD", nil)
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return nil
+	}
+	m := sinaRe.FindStringSubmatch(decodeGBK(raw))
+	if len(m) < 2 || m[1] == "" {
+		return nil
+	}
+	f := strings.Split(m[1], ",")
+	if len(f) < 9 {
+		return nil
+	}
+	price, err := strconv.ParseFloat(f[8], 64) // 最新价
+	if err != nil || price <= 0 || math.IsNaN(price) {
+		return nil
+	}
+	prev, _ := strconv.ParseFloat(f[7], 64) // 昨收
+	if prev <= 0 {
+		prev = price
+	}
+	return &Quote{AssetID: a.ID, Price: price, PrevClose: prev,
+		ChgPct: (price/prev - 1) * 100, Currency: "CNY",
+		SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
 var sinaRe = regexp.MustCompile(`"([^"]*)"`)
@@ -385,10 +543,14 @@ func clean(p float64) bool { return p > 0 && !math.IsNaN(p) && !math.IsInf(p, 0)
 func UpdateOne(a Asset) *Quote {
 	m := Mode()
 	var real *Quote
-	if m == "auto" || m == "real" {
+	if (m == "auto" || m == "real") && HasProvider(a) {
 		real = fetchReal(a)
 		if real != nil && !clean(real.Price) {
 			real = nil
+		}
+		if real == nil {
+			log.Printf("[quotes] real fetch unavailable for %s/%s (mode=%s)", a.Category, a.Symbol, m)
+			atomic.AddInt64(&srcFailTotal, 1)
 		}
 	}
 
@@ -398,6 +560,12 @@ func UpdateOne(a Asset) *Quote {
 	var q *Quote
 	if real != nil {
 		q = real
+	} else if !HasProvider(a) || (a.Category == "fund" && a.SubType != "etf") {
+		// Structurally no upstream source, or an off-exchange fund whose net
+		// value source is unavailable: report honestly as "nosource" rather
+		// than fabricating a simulator price that would pollute PnL.
+		q = &Quote{AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
+			Currency: a.Currency, SourceTime: 0, Status: "nosource"}
 	} else {
 		if sim[a.ID] == nil {
 			vol := simVol[a.Category]
@@ -431,17 +599,42 @@ func UpdateOne(a Asset) *Quote {
 	return &c
 }
 
-// PollAll refreshes every active asset and rolls the latest candle forward.
+// PollAll refreshes every active asset concurrently (bounded) and rolls the
+// latest candle forward. Network fetches run in parallel; cache writes stay
+// serialized inside UpdateOne; K-line backfills run sequentially afterward.
 func PollAll() []Quote {
 	assets := activeAssets()
+	if len(assets) == 0 {
+		return nil
+	}
+	const maxParallel = 8
+	sem := make(chan struct{}, maxParallel)
+	results := make([]*Quote, len(assets))
+	var wg sync.WaitGroup
+	for i, a := range assets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, a Asset) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			q := UpdateOne(a)
+			if q != nil {
+				c := *q
+				results[i] = &c
+			}
+		}(i, a)
+	}
+	wg.Wait()
 	out := make([]Quote, 0, len(assets))
-	for _, a := range assets {
-		q := UpdateOne(a)
+	for i, a := range assets {
+		q := results[i]
 		if q == nil {
 			continue
 		}
 		out = append(out, *q)
-		bumpKline(a, q.Price)
+		if q.Status != "nosource" {
+			bumpKline(a, q.Price)
+		}
 	}
 	return out
 }
@@ -452,12 +645,18 @@ func PersistPrices() {
 	defer mu.RUnlock()
 	now := time.Now().UnixMilli()
 	for id, q := range cache {
-		_, _ = store.Exec(`INSERT INTO price_snapshots(id, asset_id, price, currency, source_time, created_at) VALUES(?,?,?,?,?,?)`,
-			cryptox.UUID(), id, q.Price, q.Currency, q.SourceTime, now)
+		if q.Status == "sim" {
+			continue // never persist fabricated prices
+		}
+		_, _ = store.Exec(`INSERT INTO price_snapshots(id, asset_id, price, currency, source_time, status, created_at) VALUES(?,?,?,?,?,?,?)`,
+			cryptox.UUID(), id, q.Price, q.Currency, q.SourceTime, q.Status, now)
 	}
 	// keep the table bounded
 	_, _ = store.Exec(`DELETE FROM price_snapshots WHERE created_at < ?`, now-30*86400000)
 }
+
+// SourceFailTotal returns the cumulative count of failed real-source fetches.
+func SourceFailTotal() int64 { return atomic.LoadInt64(&srcFailTotal) }
 
 // ---- K-line -------------------------------------------------------------
 

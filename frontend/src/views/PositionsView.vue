@@ -82,7 +82,7 @@ async function saveAsset() {
 function openTrade(row, direction) {
   Object.assign(tradeForm, {
     assetId: row.assetId, assetName: row.name, direction,
-    quantity: '', price: row.price ? String(row.price) : '', fee: '0', date: dateInput(), remark: '',
+    quantity: '', price: row.quoteStatus === 'ok' ? String(row.price) : '', fee: '0', date: dateInput(), remark: '',
   });
   showTrade.value = true;
 }
@@ -200,10 +200,11 @@ async function toggleWatch(row) {
                 <span class="tag">{{ r.symbol }}</span>
                 <span v-if="r.quoteStatus === 'sim'" class="tag" title="当前为模拟行情，价格非真实市场价">模拟</span>
                 <span v-else-if="r.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败，当前显示的是上次缓存或模拟价格">行情失效</span>
+                <span v-else-if="r.quoteStatus === 'nosource'" class="tag warn" title="暂无可用行情源（如场外基金、白名单外币种）">无源</span>
               </td>
               <td class="num">{{ r.qty > 0 ? price(r.qty) : '--' }}</td>
               <td class="num">{{ r.qty > 0 ? price(r.avgCost) : '--' }}</td>
-              <td class="num strong">{{ price(r.price) }}</td>
+              <td class="num strong">{{ r.quoteStatus === 'nosource' ? '—' : price(r.price) }}</td>
               <td class="num" :class="dirClass(r.chgPct)">{{ pctRaw(r.chgPct) }}</td>
               <td class="num">{{ money(r.marketValue, r.currency) }}</td>
               <td class="num" :class="dirClass(r.floatingPnl)">{{ signed(r.floatingPnl, r.currency) }}</td>

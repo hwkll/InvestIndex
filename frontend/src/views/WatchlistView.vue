@@ -88,8 +88,9 @@ onMounted(load);
           <span class="tag">{{ w.symbol }}</span>
           <span v-if="w.quoteStatus === 'sim'" class="tag" title="模拟行情">模拟</span>
           <span v-else-if="w.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败">失效</span>
+          <span v-else-if="w.quoteStatus === 'nosource'" class="tag warn" title="暂无可用行情源（如场外基金、白名单外币种）">无源</span>
         </div>
-        <div class="wc-price num">{{ price(w.price) }} <span class="num" :class="dirClass(w.chgPct)">{{ pctRaw(w.chgPct) }}</span></div>
+        <div class="wc-price num">{{ w.quoteStatus === 'nosource' ? '—' : price(w.price) }} <span v-if="w.quoteStatus !== 'nosource'" class="num" :class="dirClass(w.chgPct)">{{ pctRaw(w.chgPct) }}</span></div>
         <div class="wc-meta">
           <span v-if="w.targetPrice" :class="{ hit: w.aboveTarget }">
             目标价 {{ price(w.targetPrice) }}

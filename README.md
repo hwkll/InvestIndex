@@ -51,7 +51,7 @@ InvestHub 是一个**纯本地、自托管**的个人投资管理平台。它把
 
 - 所有数据存在本机一个 SQLite 文件里，**不上传任何服务器**
 - API Key 等敏感配置用 **AES-256-GCM 加密**后落盘，主密钥单独存放且权限 `0600`
-- 唯一的出网请求是你主动开启的行情源（CoinGecko / 新浪财经）和可选的 DeepSeek API
+- 唯一的出网请求是你主动开启的行情源（Binance / 新浪财经）和可选的 DeepSeek API
 - 断网可用：行情源不可达时自动降级到内置模拟器，功能不中断
 
 ---
@@ -365,11 +365,14 @@ go build -ldflags="-s -w" -o investhub ./cmd/investhub    # 约 17MB → 12MB
 
 ### 行情数据源
 
-| 类型 | 数据源 | 标识 |
-|------|--------|------|
-| 加密货币 | CoinGecko 公开 API | `coingecko` |
-| A 股 / ETF | 新浪财经行情接口 | `sina` |
-| 全部 | 内置随机游走模拟器 | `sim` |
+| 类型 | 数据源 | 标识 | 计价 |
+|------|--------|------|------|
+| 加密货币 | Binance 公开行情接口（24h ticker，无需 key） | `binance` | USD |
+| A 股 / 场内 ETF | 新浪财经行情接口 | `sina` | CNY |
+| 现货黄金 | 新浪 `gds_AUTD`（上海金交所 Au(T+D)，CNY/克） | `sge` | CNY |
+| 黄金 ETF（场内） | 新浪财经行情接口 | `sina` | CNY |
+| 场外开放式基金 | 天天基金净值（东方财富；当前部署环境不可达，拉取失败时诚实标注 `nosource`，不会编造价格） | `fund_eastmoney` | CNY |
+| 全部 | 内置随机游走模拟器（真实源不可用时的兜底） | `sim` | — |
 
 行情带内存缓存和 K 线缓存，避免重复请求打爆上游。每条行情携带 `status`：`ok`（真实源）/ `sim`（模拟器）/ `stale`（真实源但数据偏旧）。
 
@@ -386,7 +389,7 @@ InvestIndex/
 │   ├── store/       store.go   # SQLite 连接、16 张表建表 DDL、查询辅助、seed
 │   ├── cryptox/               # 主密钥管理、AES-256-GCM 加解密、scrypt 哈希
 │   ├── settings/   settings.go # KV 配置，敏感键自动加密
-│   ├── quotes/     quotes.go   # 行情抓取（CoinGecko / 新浪）、模拟器、缓存、K 线
+│   ├── quotes/     quotes.go   # 行情抓取（Binance / 新浪）、模拟器、缓存、K 线
 │   ├── indicators/             # MA / MACD / RSI / KDJ / BOLL 等技术指标计算
 │   ├── core/                   # 核心业务：资产、交易、持仓成本、盈亏、快照、现金
 │   │   ├── core.go             #   资产 / 持仓 / 汇总 / 基准对比 / FX 换算
@@ -863,4 +866,4 @@ go build ./...
 
 ## 许可
 
-个人自用项目，代码可自由修改使用。行情数据来自 CoinGecko 与新浪财经的公开接口，请遵守各自的使用条款。
+个人自用项目，代码可自由修改使用。行情数据来自 Binance 与新浪财经的公开接口，请遵守各自的使用条款。

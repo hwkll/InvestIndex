@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     price       REAL NOT NULL,
     currency    TEXT NOT NULL,
     source_time INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'ok',
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_price_asset_time ON price_snapshots(asset_id, created_at DESC);
@@ -230,9 +232,42 @@ func Open() error {
 	if _, err := DB.Exec(DDL); err != nil {
 		return err
 	}
+	migrate()
 	seed()
 	log.Printf("[store] sqlite ready at %s", DBPath)
 	return nil
+}
+
+// migrate applies lightweight schema migrations to databases created by older
+// builds (which predate the price_snapshots.status column).
+func migrate() {
+	if hasColumn("price_snapshots", "status") {
+		return
+	}
+	if _, err := DB.Exec(`ALTER TABLE price_snapshots ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'`); err != nil {
+		log.Printf("[store] migrate price_snapshots.status failed: %v", err)
+	} else {
+		log.Printf("[store] migrated price_snapshots: added status column")
+	}
+}
+
+// hasColumn reports whether a table already carries the named column.
+func hasColumn(table, col string) bool {
+	rows, err := DB.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk) == nil && name == col {
+			return true
+		}
+	}
+	return false
 }
 
 func seed() {

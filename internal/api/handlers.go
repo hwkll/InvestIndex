@@ -1,7 +1,11 @@
 package api
 
 import (
+	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -12,6 +16,18 @@ import (
 	"investhub/internal/settings"
 	"investhub/internal/store"
 )
+
+// createFetchTimeout bounds how long handleCreateAsset waits for a real quote
+// before falling back to the simulator value. Tunable via CREATE_FETCH_TIMEOUT
+// (milliseconds); defaults to 1500ms.
+var createFetchTimeout = func() time.Duration {
+	if v := os.Getenv("CREATE_FETCH_TIMEOUT"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 1500 * time.Millisecond
+}()
 
 // ---------------- assets ----------------
 
@@ -29,8 +45,48 @@ func handleCreateAsset(r *http.Request) (any, error) {
 		return nil, err
 	}
 	store.MarkOnboarded() // user's first real asset clears the seeded-demo banner
-	quotes.AddAsset(quotes.Asset{ID: a.ID, Category: a.Category, Symbol: a.Symbol, Currency: a.Currency, Provider: a.Provider})
-	return a, nil
+
+	// P0: pull a real price immediately after creation so the first screen
+	// shows a real quote instead of the seeded simulator value. A background
+	// goroutine fetches the quote; we wait up to createFetchTimeout for it, and
+	// if it lands broadcast it over SSE. On timeout we keep the simulator value
+	// and let the goroutine finish and broadcast the real quote when it arrives.
+	asset := quotes.Asset{ID: a.ID, Category: a.Category, Symbol: a.Symbol, SubType: a.SubType, Currency: a.Currency, Provider: a.Provider}
+	done := make(chan *quotes.Quote, 1)
+	fetch := func() (q *quotes.Quote) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[create] UpdateOne panic for %s: %v", a.ID, rec)
+			}
+		}()
+		return quotes.UpdateOne(asset)
+	}
+	go func() { done <- fetch() }()
+	select {
+	case q := <-done:
+		if q != nil && q.Status != "nosource" {
+			quotes.EnsureKline(asset, "1d", 200)
+		}
+		if q != nil && q.Status == "ok" {
+			Broadcast("quote", q)
+		}
+	case <-time.After(createFetchTimeout):
+		// Timed out: the goroutine keeps running; backfill K-line and broadcast
+		// the real quote once the fetch completes in the background.
+		go func() {
+			res := <-done
+			if res == nil {
+				return
+			}
+			if res.Status != "nosource" {
+				quotes.EnsureKline(asset, "1d", 200)
+			}
+			if res.Status == "ok" {
+				Broadcast("quote", res)
+			}
+		}()
+	}
+	return core.GetAsset(a.ID), nil
 }
 
 func handleUpdateAsset(r *http.Request) (any, error) {
