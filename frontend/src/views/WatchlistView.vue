@@ -86,8 +86,7 @@ onMounted(load);
         <div class="wc-head">
           <router-link class="link" :to="`/assets/${w.assetId}`">{{ w.name }}</router-link>
           <span class="tag">{{ w.symbol }}</span>
-          <span v-if="w.quoteStatus === 'sim'" class="tag" title="模拟行情">模拟</span>
-          <span v-else-if="w.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败">失效</span>
+          <span v-if="w.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败">失效</span>
           <span v-else-if="w.quoteStatus === 'nosource'" class="tag warn" title="暂无可用行情源（如场外基金、白名单外币种）">无源</span>
         </div>
         <div class="wc-price num">{{ w.quoteStatus === 'nosource' ? '—' : price(w.price) }} <span v-if="w.quoteStatus !== 'nosource'" class="num" :class="dirClass(w.chgPct)">{{ pctRaw(w.chgPct) }}</span></div>

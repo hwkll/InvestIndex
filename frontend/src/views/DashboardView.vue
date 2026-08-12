@@ -218,11 +218,11 @@ const trendOption = computed(() => {
       </div>
     </div>
 
-    <!-- Next-①: quote transparency banner -->
-    <div v-if="summary && (summary.quoteSimCount > 0 || summary.quoteStaleCount > 0)" class="quote-banner">
+    <!-- quote transparency banner -->
+    <div v-if="summary && summary.quoteNosourceCount > 0" class="quote-banner">
       <span class="qb-ico">⚠</span>
       <div>
-        当前有 <b>{{ summary.quoteSimCount }}</b> 个标的为模拟行情<template v-if="summary.quoteStaleCount > 0">，<b>{{ summary.quoteStaleCount }}</b> 个行情获取失败（显示上次/模拟价）</template>，价格非真实市场价，仅供参考。
+        当前有 <b>{{ summary.quoteNosourceCount }}</b> 个标的暂无真实行情源（行情获取失败或该分类暂未接入真实源），价格可能为空，请以实时市场价为准。
       </div>
     </div>
 

@@ -182,8 +182,7 @@ async function analyze() {
         <div class="page-sub">
           现价 <b class="num">{{ livePos?.quoteStatus === 'nosource' ? '—' : price(livePos?.price) }}</b>
           <span v-if="livePos?.quoteStatus !== 'nosource'" class="num" :class="dirClass(livePos?.chgPct)"> {{ pctRaw(livePos?.chgPct) }}</span>
-          <span v-if="livePos?.quoteStatus === 'sim'" class="tag" title="当前为模拟行情，价格非真实市场价">模拟行情</span>
-          <span v-else-if="livePos?.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败，当前显示的是上次缓存或模拟价格">行情失效</span>
+          <span v-if="livePos?.quoteStatus === 'stale'" class="tag warn" title="真实行情获取失败，当前显示上次缓存价">行情失效</span>
           <span v-else-if="livePos?.quoteStatus === 'nosource'" class="tag warn" title="暂无可用行情源（如场外基金、白名单外币种）">暂无行情源</span>
         </div>
       </div>

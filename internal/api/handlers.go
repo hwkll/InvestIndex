@@ -19,7 +19,7 @@ import (
 )
 
 // createFetchTimeout bounds how long handleCreateAsset waits for a real quote
-// before falling back to the simulator value. Tunable via CREATE_FETCH_TIMEOUT
+// before accepting a "nosource" placeholder. Tunable via CREATE_FETCH_TIMEOUT
 // (milliseconds); defaults to 1500ms.
 var createFetchTimeout = func() time.Duration {
 	if v := os.Getenv("CREATE_FETCH_TIMEOUT"); v != "" {
@@ -48,10 +48,10 @@ func handleCreateAsset(r *http.Request) (any, error) {
 	store.MarkOnboarded() // user's first real asset clears the seeded-demo banner
 
 	// P0: pull a real price immediately after creation so the first screen
-	// shows a real quote instead of the seeded simulator value. A background
-	// goroutine fetches the quote; we wait up to createFetchTimeout for it, and
-	// if it lands broadcast it over SSE. On timeout we keep the simulator value
-	// and let the goroutine finish and broadcast the real quote when it arrives.
+	// shows a real quote. A background goroutine fetches the quote; we wait up
+	// to createFetchTimeout for it, and if it lands broadcast it over SSE. On
+	// timeout we keep the "nosource" placeholder and let the goroutine finish
+	// and broadcast the real quote when it arrives.
 	asset := quotes.Asset{ID: a.ID, Category: a.Category, Symbol: a.Symbol, SubType: a.SubType, Currency: a.Currency, Provider: a.Provider}
 	done := make(chan *quotes.Quote, 1)
 	fetch := func() (q *quotes.Quote) {

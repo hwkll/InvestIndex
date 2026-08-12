@@ -44,9 +44,8 @@ const changed = computed(() => {
 const dirty = computed(() => changed.value.length > 0);
 
 const SOURCES = [
-  { v: 'auto', ico: '◈', name: '自动', desc: '联网取真实行情，断网自动回退模拟' },
+  { v: 'auto', ico: '◈', name: '自动', desc: '联网取真实行情，断网/无源时显示「暂无行情源」（绝不回退模拟）' },
   { v: 'real', ico: '◉', name: '真实数据', desc: 'CoinGecko / 新浪财经' },
-  { v: 'sim', ico: '◌', name: '模拟数据', desc: '随机游走，完全离线可用' },
 ];
 
 async function load() {

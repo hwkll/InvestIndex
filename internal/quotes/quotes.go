@@ -1,13 +1,14 @@
-// Package quotes provides market data: real providers with graceful degradation
-// to a deterministic random-walk simulator, plus K-line storage.
+// Package quotes provides real market data with graceful degradation to
+// "nosource" when no upstream source is available, plus K-line storage.
 package quotes
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -28,7 +29,7 @@ type Quote struct {
 	ChgPct     float64 `json:"chgPct"`
 	Currency   string  `json:"currency"`
 	SourceTime int64   `json:"sourceTime"`
-	Status     string  `json:"status"` // ok | nosource | sim (sim only in explicit sim mode)
+	Status     string  `json:"status"` // ok | nosource
 }
 
 // Candle is one K-line bar.
@@ -51,29 +52,23 @@ type Asset struct {
 	Provider string
 }
 
-var simVol = map[string]float64{"crypto": 0.018, "stock": 0.009, "fund": 0.004, "gold": 0.006}
-
 var (
-	mu    sync.RWMutex
+	mu sync.RWMutex
 	cache = map[string]*Quote{}
-	sim   = map[string]*simState{}
 
-	// Mode: auto (try real, fall back to sim) | real | sim
+	// Mode: auto (try real) | real. "sim" was removed — all data is real;
+	// when no source is available the quote reports "nosource".
 	mode = "auto"
 
 	httpc = &http.Client{Timeout: 6 * time.Second}
 )
 
-type simState struct {
-	price float64
-	vol   float64
-}
-
-// SetMode switches the data-source strategy.
+// SetMode switches the data-source strategy. Only "auto" (try real) and
+// "real" are accepted; "sim" is no longer supported — all data must be real.
 func SetMode(m string) {
 	mu.Lock()
 	defer mu.Unlock()
-	if m == "auto" || m == "real" || m == "sim" {
+	if m == "auto" || m == "real" {
 		mode = m
 	}
 }
@@ -83,44 +78,6 @@ func Mode() string {
 	mu.RLock()
 	defer mu.RUnlock()
 	return mode
-}
-
-func hashNum(s string) int {
-	h := 0
-	for _, c := range s {
-		h = (h*31 + int(c)) & 0x7fffffff
-	}
-	return h
-}
-
-// DefaultPrice provides a plausible starting price for an asset.
-func DefaultPrice(a Asset) float64 {
-	sym := strings.ToUpper(a.Symbol)
-	known := map[string]float64{
-		"BTC": 61000, "ETH": 3050, "SOL": 152, "BNB": 580,
-		"XRP": 0.62, "DOGE": 0.16, "ADA": 0.45, "XAU": 560,
-	}
-	if p, ok := known[sym]; ok {
-		return p
-	}
-	switch a.Category {
-	case "crypto":
-		return 10 + float64(hashNum(sym)%400)
-	case "gold":
-		return 540 + float64(hashNum(sym)%40)
-	case "fund":
-		return 0.8 + float64(hashNum(sym)%350)/100
-	}
-	if strings.HasPrefix(a.Symbol, "sh.600519") {
-		return 1480
-	}
-	if strings.HasPrefix(a.Symbol, "sh.000001") || strings.HasPrefix(a.Symbol, "sz.000001") {
-		return 11.5
-	}
-	if strings.HasPrefix(a.Symbol, "sz.000858") {
-		return 140
-	}
-	return 8 + float64(hashNum(sym)%1800)
 }
 
 func activeAssets() []Asset {
@@ -152,12 +109,10 @@ func activeAssets() []Asset {
 	return out
 }
 
-// SeedState primes the in-memory cache for every active asset. The live quote
-// is seeded as "nosource" (price 0) rather than a last-snapshot/DefaultPrice
-// value: between process start and the first PollAll, a fabricated number
-// presented as a live quote is worse than showing nothing. The simulator state
-// is still primed from the last snapshot (or DefaultPrice) so K-line backfill
-// and explicit sim mode keep a sensible starting point.
+// SeedState primes the in-memory cache for every active asset with a neutral
+// "nosource" (price 0) entry so the asset is never "unknown" and never flashes
+// a fabricated number before its first real fetch. The API handler is
+// responsible for pulling a real quote (and backfilling K-line) right after.
 func SeedState() {
 	for _, a := range activeAssets() {
 		mu.RLock()
@@ -166,21 +121,12 @@ func SeedState() {
 		if exists {
 			continue
 		}
-		price := store.ScalarFloat(`SELECT price FROM price_snapshots WHERE asset_id=? ORDER BY created_at DESC LIMIT 1`, a.ID)
-		if price <= 0 {
-			price = DefaultPrice(a)
-		}
-		vol := simVol[a.Category]
-		if vol == 0 {
-			vol = 0.01
-		}
 		mu.Lock()
 		// Re-check: another goroutine may have added it between the RUnlock and Lock.
 		if _, doubleCheck := cache[a.ID]; doubleCheck {
 			mu.Unlock()
 			continue
 		}
-		sim[a.ID] = &simState{price: price, vol: vol}
 		cache[a.ID] = &Quote{
 			AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
 			Currency: a.Currency, SourceTime: 0, Status: "nosource",
@@ -193,8 +139,7 @@ func SeedState() {
 // neutral "nosource" entry (price 0) so the asset is never "unknown" and never
 // flashes a fabricated number before its first real fetch; the API handler is
 // responsible for pulling a real quote (and backfilling K-line) right after
-// creation. The simState is still primed from DefaultPrice so explicit sim mode
-// and K-line backfill keep a sensible starting point.
+// creation.
 // Idempotent: re-adding an existing asset is a no-op.
 func AddAsset(a Asset) {
 	mu.RLock()
@@ -203,13 +148,7 @@ func AddAsset(a Asset) {
 		return
 	}
 	mu.RUnlock()
-	price := DefaultPrice(a)
-	vol := simVol[a.Category]
-	if vol == 0 {
-		vol = 0.01
-	}
 	mu.Lock()
-	sim[a.ID] = &simState{price: price, vol: vol}
 	cache[a.ID] = &Quote{
 		AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
 		Currency: a.Currency, SourceTime: 0, Status: "nosource",
@@ -808,17 +747,10 @@ func decodeGBK(b []byte) string {
 	return string(out)
 }
 
-// ---- simulator ----------------------------------------------------------
-
-func simStep(assetID string) float64 {
-	s := sim[assetID]
-	if s == nil {
-		return 0
-	}
-	drift := (rand.Float64()*2 - 1) * s.vol
-	s.price = math.Max(0.0001, s.price*(1+drift))
-	return s.price
-}
+// ---- simulator (removed) ----------------------------------------------
+// The explicit random-walk simulator ("sim" mode) was deleted: all quote data
+// must be real. When no upstream source is reachable the quote reports
+// "nosource" instead of a fabricated price.
 
 // clean rejects obviously bad ticks.
 func clean(p float64) bool { return p > 0 && !math.IsNaN(p) && !math.IsInf(p, 0) }
@@ -840,43 +772,13 @@ func UpdateOne(a Asset) *Quote {
 
 	mu.Lock()
 	defer mu.Unlock()
-	old := cache[a.ID]
 	var q *Quote
 	if real != nil {
 		q = real
-	} else if !HasProvider(a) || (a.Category == "fund" && a.SubType != "etf") {
-		// Structurally no upstream source, or an off-exchange fund whose net
-		// value source is unavailable: report honestly as "nosource" rather
-		// than fabricating a simulator price that would pollute PnL.
-		q = &Quote{AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
-			Currency: a.Currency, SourceTime: 0, Status: "nosource"}
-	} else if m == "sim" {
-		// Explicit simulator mode: generate a synthetic price (offline/demo use).
-		if sim[a.ID] == nil {
-			vol := simVol[a.Category]
-			if vol == 0 {
-				vol = 0.01
-			}
-			start := DefaultPrice(a)
-			if old != nil {
-				start = old.Price
-			}
-			sim[a.ID] = &simState{price: start, vol: vol}
-		}
-		price := simStep(a.ID)
-		prev := price
-		if old != nil {
-			prev = old.PrevClose
-		}
-		chg := 0.0
-		if prev > 0 {
-			chg = (price/prev - 1) * 100
-		}
-		q = &Quote{AssetID: a.ID, Price: price, PrevClose: prev, ChgPct: chg,
-			Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: "sim"}
 	} else {
-		// Auto/real mode but no usable real price: report honestly as "nosource"
-		// instead of fabricating a simulator price that would pollute PnL/display.
+		// No usable real price (no provider, or the provider was unreachable /
+		// returned nothing): report honestly as "nosource" rather than
+		// fabricating a simulator price that would pollute PnL/display.
 		q = &Quote{AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
 			Currency: a.Currency, SourceTime: 0, Status: "nosource"}
 	}
@@ -919,7 +821,7 @@ func PollAll() []Quote {
 		}
 		out = append(out, *q)
 		if q.Status != "nosource" {
-			bumpKline(a, q.Price)
+			bumpKline(a, q.Price, 200)
 		}
 	}
 	return out
@@ -931,7 +833,7 @@ func PersistPrices() {
 	defer mu.RUnlock()
 	now := time.Now().UnixMilli()
 	for id, q := range cache {
-		if q.Status == "sim" || q.Status == "nosource" {
+		if q.Status == "nosource" {
 			// Never persist fabricated prices, and never persist price=0
 			// placeholders (a 0 row is not a price and would only pollute
 			// snapshot history / seeding).
@@ -949,7 +851,10 @@ func SourceFailTotal() int64 { return atomic.LoadInt64(&srcFailTotal) }
 
 // ---- K-line -------------------------------------------------------------
 
-// EnsureKline backfills a synthetic daily history when none exists yet.
+// EnsureKline guarantees real daily history exists for an asset+period. If a
+// real source is reachable it is fetched and persisted (oldest-first); if not,
+// nothing is written — an empty K-line is honest "no real data", never a
+// fabricated series.
 func EnsureKline(a Asset, period string, limit int) {
 	if period == "" {
 		period = "1d"
@@ -957,27 +862,10 @@ func EnsureKline(a Asset, period string, limit int) {
 	if store.ScalarInt(`SELECT COUNT(*) FROM kline_cache WHERE asset_id=? AND period=?`, a.ID, period) > 0 {
 		return
 	}
-	cur := DefaultPrice(a)
-	if q := Get(a.ID); q != nil && q.Price > 0 {
-		cur = q.Price
+	candles := fetchKlineReal(a, limit)
+	if len(candles) == 0 {
+		return // no real source / network unreachable: write nothing
 	}
-	days := limit
-	if days > 180 || days <= 0 {
-		days = 180
-	}
-	vol := simVol[a.Category]
-	if vol == 0 {
-		vol = 0.01
-	}
-	closes := make([]float64, days)
-	p := cur / (1 + (rand.Float64()*2-1)*vol*20)
-	closes[0] = p
-	for i := 1; i < days; i++ {
-		p = math.Max(0.0001, p*(1+(rand.Float64()*2-1)*vol*3))
-		closes[i] = p
-	}
-	closes[days-1] = cur
-
 	tx, err := store.DB.Begin()
 	if err != nil {
 		return
@@ -987,34 +875,230 @@ func EnsureKline(a Asset, period string, limit int) {
 		_ = tx.Rollback()
 		return
 	}
-	now := time.Now().UnixMilli()
-	const day = int64(86400000)
-	for i := 0; i < days; i++ {
-		c := closes[i]
-		o := c * (1 - vol)
-		if i > 0 {
-			o = closes[i-1]
-		}
-		h := math.Max(o, c) * (1 + rand.Float64()*vol)
-		l := math.Min(o, c) * (1 - rand.Float64()*vol)
-		ts := now - int64(days-1-i)*day
-		_, _ = stmt.Exec(cryptox.UUID(), a.ID, period, ts, o, h, l, c, rand.Float64()*1000+100)
+	for _, c := range candles {
+		_, _ = stmt.Exec(cryptox.UUID(), a.ID, period, c.Ts, c.Open, c.High, c.Low, c.Close, c.Volume)
 	}
 	_ = stmt.Close()
 	_ = tx.Commit()
 }
 
-func bumpKline(a Asset, price float64) {
+func bumpKline(a Asset, price float64, limit int) {
 	var id string
 	var high, low float64
 	err := store.QueryRow(`SELECT id, high, low FROM kline_cache WHERE asset_id=? AND period='1d' ORDER BY ts DESC LIMIT 1`, a.ID).
 		Scan(&id, &high, &low)
 	if err != nil {
-		EnsureKline(a, "1d", 200)
+		// No existing candle yet: try to backfill real daily history. If no
+		// real source is reachable this writes nothing (empty is honest).
+		EnsureKline(a, "1d", limit)
 		return
 	}
 	_, _ = store.Exec(`UPDATE kline_cache SET close=?, high=?, low=? WHERE id=?`,
 		price, math.Max(high, price), math.Min(low, price), id)
+}
+
+// fetchKlineReal pulls real daily candles for an asset by category. Every
+// request goes through httpc (6s timeout, ProxyFromEnvironment). On any network
+// error or parse failure it returns nil — the caller must NOT fabricate data.
+func fetchKlineReal(a Asset, limit int) []Candle {
+	if limit <= 0 {
+		limit = 180
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	switch a.Category {
+	case "crypto":
+		return fetchKlineBinance(a, limit)
+	case "fund":
+		if a.SubType == "etf" {
+			return fetchKlineSina(a, limit)
+		}
+		return fetchKlineFund(a, limit)
+	case "stock":
+		return fetchKlineSina(a, limit)
+	case "gold":
+		normGoldSubType(&a)
+		if a.SubType == "etf" {
+			return fetchKlineSina(a, limit)
+		}
+		if isXAU(a) {
+			return nil // international London gold: no daily series source wired
+		}
+		return fetchKlineGoldSpot(a, limit)
+	}
+	return nil
+}
+
+// fetchKlineBinance pulls real daily klines from Binance's public REST API.
+func fetchKlineBinance(a Asset, limit int) []Candle {
+	sym := strings.ToUpper(strings.TrimSpace(a.Symbol))
+	if !strings.HasSuffix(sym, "USDT") {
+		sym += "USDT"
+	}
+	url := "https://api.binance.com/api/v3/klines?symbol=" + sym + "&interval=1d&limit=" + strconv.Itoa(limit)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var rows [][]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rows); err != nil {
+		return nil
+	}
+	candles := make([]Candle, 0, len(rows))
+	for _, r := range rows {
+		// [openTime, open, high, low, close, volume, closeTime, ...]
+		if len(r) < 6 {
+			continue
+		}
+		openT, _ := r[0].(float64)
+		open, _ := strconv.ParseFloat(fmt.Sprint(r[1]), 64)
+		high, _ := strconv.ParseFloat(fmt.Sprint(r[2]), 64)
+		low, _ := strconv.ParseFloat(fmt.Sprint(r[3]), 64)
+		close, _ := strconv.ParseFloat(fmt.Sprint(r[4]), 64)
+		vol, _ := strconv.ParseFloat(fmt.Sprint(r[5]), 64)
+		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
+			continue
+		}
+		candles = append(candles, Candle{
+			Ts: int64(openT), Open: open, High: high, Low: low, Close: close, Volume: vol,
+		})
+	}
+	return candles
+}
+
+// fetchKlineFund pulls real daily NAV history for an off-exchange (open-end)
+// fund from Eastmoney's public F10 history endpoint. Each NAV has no OHLC, so
+// open=high=low=close=NAV and volume=0.
+func fetchKlineFund(a Asset, limit int) []Candle {
+	code := strings.TrimSpace(a.Symbol)
+	if code == "" {
+		return nil
+	}
+	url := "https://api.fund.eastmoney.com/f10/lsjz?fundCode=" + code + "&pageIndex=1&pageSize=" + strconv.Itoa(limit)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "https://fundf10.eastmoney.com/jjjz_"+code+".html")
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+	var j struct {
+		Data struct {
+			List []struct {
+				FSRQ  string `json:"FSRQ"` // 净值日期
+				DWJZ  string `json:"DWJZ"` // 单位净值
+				JZZZL string `json:"JZZZL"`
+			} `json:"LSJZList"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(raw, &j); err != nil {
+		return nil
+	}
+	if len(j.Data.List) == 0 {
+		return nil
+	}
+	// Eastmoney returns newest-first; reverse to oldest-first before persisting.
+	list := j.Data.List
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
+	candles := make([]Candle, 0, len(list))
+	for _, r := range list {
+		ts, derr := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.FSRQ), time.Local)
+		if derr != nil {
+			continue
+		}
+		close, cerr := strconv.ParseFloat(strings.TrimSpace(r.DWJZ), 64)
+		if cerr != nil || close <= 0 {
+			continue
+		}
+		candles = append(candles, Candle{
+			Ts: ts.UnixMilli(), Open: close, High: close, Low: close, Close: close, Volume: 0,
+		})
+	}
+	return candles
+}
+
+// fetchKlineSinaSymbol pulls real daily klines from Sina's public K-line API
+// for a pre-built Sina symbol (e.g. sh600519 / hk09866 / gdsAUTD).
+func fetchKlineSinaSymbol(symbol string, limit int) []Candle {
+	if symbol == "" {
+		return nil
+	}
+	url := "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=" + symbol + "&scale=240&ma=no&datalen=" + strconv.Itoa(limit)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+	var rows []struct {
+		Day    string `json:"day"`
+		Open   string `json:"open"`
+		High   string `json:"high"`
+		Low    string `json:"low"`
+		Close  string `json:"close"`
+		Volume string `json:"volume"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil
+	}
+	candles := make([]Candle, 0, len(rows))
+	for _, r := range rows {
+		ts, derr := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.Day), time.Local)
+		if derr != nil {
+			continue
+		}
+		open, _ := strconv.ParseFloat(strings.TrimSpace(r.Open), 64)
+		high, _ := strconv.ParseFloat(strings.TrimSpace(r.High), 64)
+		low, _ := strconv.ParseFloat(strings.TrimSpace(r.Low), 64)
+		close, _ := strconv.ParseFloat(strings.TrimSpace(r.Close), 64)
+		vol, _ := strconv.ParseFloat(strings.TrimSpace(r.Volume), 64)
+		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
+			continue
+		}
+		candles = append(candles, Candle{
+			Ts: ts.UnixMilli(), Open: open, High: high, Low: low, Close: close, Volume: vol,
+		})
+	}
+	return candles
+}
+
+// fetchKlineSina pulls real daily klines for an A-share / ETF / HK stock via
+// Sina, routing through the shared sinaCode construction in fetchReal.
+func fetchKlineSina(a Asset, limit int) []Candle {
+	return fetchKlineSinaSymbol(sinaCode(a), limit)
+}
+
+// fetchKlineGoldSpot pulls real daily klines for the SGE Au(T+D) spot gold via
+// Sina's gdsAUTD feed (same code the realtime quote uses, without the
+// underscore). Returns nil on any parse failure — never fabricates a series.
+func fetchKlineGoldSpot(a Asset, limit int) []Candle {
+	return fetchKlineSinaSymbol("gdsAUTD", limit)
 }
 
 // Kline returns the most recent `limit` candles for an asset.
@@ -1026,10 +1110,20 @@ func Kline(assetID, period string, limit int) []Candle {
 		limit = 200
 	}
 	var a Asset
-	err := store.QueryRow(`SELECT id, category, symbol, currency, provider FROM assets WHERE id=?`, assetID).
-		Scan(&a.ID, &a.Category, &a.Symbol, &a.Currency, &a.Provider)
+	var subType, currency, provider sql.NullString
+	err := store.QueryRow(`SELECT id, category, symbol, sub_type, currency, provider FROM assets WHERE id=?`, assetID).
+		Scan(&a.ID, &a.Category, &a.Symbol, &subType, &currency, &provider)
 	if err != nil {
 		return []Candle{}
+	}
+	if subType.Valid {
+		a.SubType = subType.String
+	}
+	if currency.Valid {
+		a.Currency = currency.String
+	}
+	if provider.Valid {
+		a.Provider = provider.String
 	}
 	EnsureKline(a, period, limit)
 	rows, err := store.Query(`SELECT ts, open, high, low, close, COALESCE(volume,0) FROM kline_cache

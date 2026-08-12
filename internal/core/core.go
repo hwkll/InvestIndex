@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 	"strconv"
 	"sync"
 	"time"
@@ -119,8 +118,6 @@ func decorate(a *assetRow) Asset {
 		health = "stale"
 	case q.Status == "ok":
 		health = "ok"
-	case q.Status == "sim":
-		health = "sim"
 	case q.Status == "nosource":
 		health = "nosource"
 	default:
@@ -205,7 +202,7 @@ func defaultProvider(cat string) string {
 	case "stock":
 		return "sina"
 	}
-	return "simulator"
+	return "manual"
 }
 
 // CreateAsset validates and inserts a new instrument.
@@ -557,8 +554,7 @@ type Summary struct {
 	Distribution      []DistSegment              `json:"distribution"`
 	AssetCount        int                        `json:"assetCount"`
 	UnreadAlertsCount int                        `json:"unreadAlertsCount"`
-	QuoteSimCount     int                        `json:"quoteSimCount"`
-	QuoteStaleCount   int                        `json:"quoteStaleCount"`
+	QuoteNosourceCount int                       `json:"quoteNosourceCount"`
 }
 
 func topMovers(items []PositionView) TopMovers {
@@ -631,9 +627,10 @@ func GlobalSummary() Summary {
 	s.AssetCount = int(store.ScalarInt(`SELECT COUNT(*) FROM assets WHERE status='active'`))
 	s.UnreadAlertsCount = int(store.ScalarInt(`SELECT COUNT(*) FROM alert_events WHERE read = 0`))
 
-	// Count how many active assets are showing simulated vs stale (real-requested
-	// but unavailable) quotes, so the dashboard can surface a transparency banner.
-	simN, staleN := 0, 0
+	// Count how many active assets currently have no real quote source, so the
+	// dashboard can surface a transparency banner. All quotes are real; when no
+	// upstream source is reachable the quote reports "nosource" (honest empty).
+	nosourceN := 0
 	qrows, _ := store.Query(`SELECT id FROM assets WHERE status='active'`)
 	if qrows != nil {
 		defer qrows.Close()
@@ -643,15 +640,12 @@ func GlobalSummary() Summary {
 				continue
 			}
 			q := quotes.Get(aid)
-			if q == nil || q.Status == "stale" {
-				staleN++
-			} else if q.Status == "sim" {
-				simN++
+			if q == nil || q.Status == "nosource" {
+				nosourceN++
 			}
 		}
 	}
-	s.QuoteSimCount = simN
-	s.QuoteStaleCount = staleN
+	s.QuoteNosourceCount = nosourceN
 	return s
 }
 
@@ -1068,75 +1062,12 @@ func TakeSnapshots() map[string]any {
 	return map[string]any{"date": date, "assets": n}
 }
 
-// SeedHistoricalSnapshots backfills synthetic history so trend charts aren't empty.
+// SeedHistoricalSnapshots previously backfilled synthetic random-walk history
+// so trend charts were never empty. That fabricated data, so it has been
+// removed: trend charts start empty and fill in from real TakeSnapshots runs.
+// Kept as a no-op so callers (scheduler) don't need to change.
 func SeedHistoricalSnapshots(days int) map[string]any {
-	if store.ScalarInt(`SELECT COUNT(*) FROM position_snapshots`) > 0 {
-		return map[string]any{"skipped": true}
-	}
-	rows, err := store.Query(`SELECT id, currency, category FROM assets WHERE status='active'`)
-	if err != nil {
-		return map[string]any{"seeded": 0}
-	}
-	type row struct{ id, cur, cat string }
-	var list []row
-	for rows.Next() {
-		var r row
-		if rows.Scan(&r.id, &r.cur, &r.cat) == nil {
-			list = append(list, r)
-		}
-	}
-	rows.Close()
-
-	vols := map[string]float64{"crypto": 0.02, "stock": 0.012, "fund": 0.006, "gold": 0.008}
-	now := time.Now()
-	for _, r := range list {
-		v := GetPositionView(r.id)
-		if v == nil || v.Qty <= 0 {
-			continue
-		}
-		vol := vols[r.cat]
-		if vol == 0 {
-			vol = 0.01
-		}
-		prices := make([]float64, days)
-		p := v.Price * (1 + (rand.Float64()*2-1)*vol*30)
-		prices[0] = p
-		for i := 1; i < days; i++ {
-			p = math.Max(1e-6, p*(1+(rand.Float64()*2-1)*vol*4))
-			prices[i] = p
-		}
-		prices[days-1] = v.Price
-		for i := 0; i < days; i++ {
-			d := now.AddDate(0, 0, -(days - 1 - i)).Format("2006-01-02")
-			lp := prices[i]
-			_, _ = store.Exec(`INSERT OR IGNORE INTO position_snapshots(id,asset_id,snapshot_date,quantity,avg_cost,cost_total,last_price,market_value,currency,created_at)
-			    VALUES(?,?,?,?,?,?,?,?,?,?)`,
-				cryptox.UUID(), r.id, d, v.Qty, v.AvgCost, v.CostTotal, lp, v.Qty*lp, r.cur, nowMs())
-		}
-	}
-	crows, err := store.Query(`SELECT id, balance, currency FROM cash_accounts`)
-	if err == nil {
-		type crow struct {
-			id, cur string
-			bal     float64
-		}
-		var clist []crow
-		for crows.Next() {
-			var c crow
-			if crows.Scan(&c.id, &c.bal, &c.cur) == nil {
-				clist = append(clist, c)
-			}
-		}
-		crows.Close()
-		for _, c := range clist {
-			for i := 0; i < days; i++ {
-				d := now.AddDate(0, 0, -(days - 1 - i)).Format("2006-01-02")
-				_, _ = store.Exec(`INSERT OR IGNORE INTO cash_snapshots(id,account_id,snapshot_date,balance,currency,created_at) VALUES(?,?,?,?,?,?)`,
-					cryptox.UUID(), c.id, d, c.bal, c.cur, nowMs())
-			}
-		}
-	}
-	return map[string]any{"seeded": days}
+	return map[string]any{"skipped": true}
 }
 
 // TrendPoint is one day of the portfolio trend.
