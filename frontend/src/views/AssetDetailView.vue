@@ -148,7 +148,7 @@ const indRows = computed(() => {
 
 async function analyze() {
   if (!localStorage.getItem('ih_ai_egress_ack')) {
-    if (!confirm('数据出境提示：AI 分析会将相关持仓与行情数据发送至 DeepSeek 境外服务器处理。确认你已了解并同意该跨境数据传输？')) {
+    if (!confirm('数据出境提示：AI 分析会将相关持仓与行情数据发送至 DeepSeek 服务器（第三方）处理。确认你已了解并同意该数据传输？')) {
       return;
     }
     localStorage.setItem('ih_ai_egress_ack', '1');

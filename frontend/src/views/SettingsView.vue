@@ -552,7 +552,7 @@ async function doImport() {
           <h3>AI 分析</h3>
           <p>需配置 DeepSeek API Key 后方可使用 AI 分析（请选用 V4 系列模型）</p>
           <div class="note warn" style="margin-top:8px;">
-            ⚠ 数据出境提示：使用 AI 分析时，相关持仓与行情数据将发送至 DeepSeek 境外服务器处理。请确认你已了解并同意该跨境数据传输，仅在合规前提下使用。
+            ⚠ 数据出境提示：使用 AI 分析时，相关持仓与行情数据将发送至 DeepSeek 服务器（第三方）处理。请确认你已了解并同意该数据传输，仅在合规前提下使用。
           </div>
         </div>
       </header>
