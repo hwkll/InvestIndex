@@ -379,7 +379,7 @@ go build -ldflags="-s -w" -o investhub ./cmd/investhub    # 约 17MB → 12MB
 | 黄金 ETF（场内） | 新浪财经行情接口 | `sina` | CNY |
 | 场外开放式基金 | 东方财富 F10 净值接口 `api.fund.eastmoney.com/f10/lsjz`（取当日 + 前一交易日单位净值，涨跌幅精确计算；`sourceTime` 为净值日期而非抓取时间） | `fund_eastmoney` | CNY |
 
-行情带内存缓存和 K 线缓存，避免重复请求打爆上游。每条行情携带 `status`：`ok`（真实源）/ `nosource`（真实源不可达，价格 0）；历史 K 线来自各分类对应的真实日线源（加密货币 Binance、A 股 / ETF / 港股新浪、场外基金东财 F10），无真实日线源的分类（如现货黄金）K 线为空。
+行情带内存缓存和 K 线缓存，避免重复请求打爆上游。每条行情携带 `status`：`ok`（真实源）/ `nosource`（真实源不可达，价格 0）；历史 K 线来自各分类对应的真实日线源（加密货币 Binance、A 股 / ETF 新浪、港股腾讯 `web.ifzq.gtimg.cn`、现货黄金新浪内盘期货沪金连续 `Au0`、场外基金东财 F10 历史净值）；无真实日线源的分类（如伦敦金 XAU）K 线为空。
 
 > 💡 **国内网络提示**：Binance / CoinGecko 在中国大陆网络下通常不可达，加密货币会显示 `nosource`。若本机已有代理，带上代理环境变量启动即可拿到真实币价（行情客户端遵循 `HTTP_PROXY` / `HTTPS_PROXY`），国内源经代理同样正常：
 > ```bash
@@ -387,7 +387,7 @@ go build -ldflags="-s -w" -o investhub ./cmd/investhub    # 约 17MB → 12MB
 > ```
 > 注意：提醒 Webhook 的出站请求**永不走代理**（SSRF 防护，见「安全」章节），不受此设置影响。
 
-> ✅ **K 线真实化**：历史 K 线已全部接入真实日线源（加密货币 Binance、A 股 / ETF / 港股新浪、场外基金东财 F10 历史净值），技术指标与 AI 技术面研判基于真实历史；无真实日线源的分类（如现货黄金）K 线为空而非合成。
+> ✅ **K 线真实化**：历史 K 线已全部接入真实日线源（加密货币 Binance、A 股 / ETF 新浪、港股腾讯、现货黄金新浪内盘期货沪金连续 `Au0`、场外基金东财 F10 历史净值），技术指标与 AI 技术面研判基于真实历史；无真实日线源的分类（如伦敦金 XAU）K 线为空而非合成。
 
 ---
 
@@ -402,7 +402,7 @@ InvestIndex/
 │   ├── store/       store.go   # SQLite 连接、16 张表建表 DDL、查询辅助、seed
 │   ├── cryptox/               # 主密钥管理、AES-256-GCM 加解密、scrypt 哈希
 │   ├── settings/   settings.go # KV 配置，敏感键自动加密
-│   ├── quotes/     quotes.go   # 行情抓取（Binance / 新浪 / 东财）、真实日线 K 线缓存、无模拟逻辑
+│   ├── quotes/     quotes.go   # 行情抓取（Binance / 新浪 / 腾讯 / 东财）、真实日线 K 线缓存、无模拟逻辑
 │   ├── indicators/             # MA / MACD / RSI / KDJ / BOLL 等技术指标计算
 │   ├── core/                   # 核心业务：资产、交易、持仓成本、盈亏、快照、现金
 │   │   ├── core.go             #   资产 / 持仓 / 汇总 / 基准对比 / FX 换算
@@ -691,7 +691,7 @@ SQLite 共 **16 张表**：
 | `price_snapshots` | 每日收盘价快照 |
 | `cash_accounts` | 现金账户 |
 | `cash_snapshots` | 每日现金快照 |
-| `kline_cache` | K 线缓存，存放各分类对应的**真实日线**（加密货币 Binance、A 股 / ETF / 港股新浪、场外基金东财 F10 历史净值）；无真实日线源的分类不写缓存，K 线为空而非合成 |
+| `kline_cache` | K 线缓存，存放各分类对应的**真实日线**（加密货币 Binance、A 股 / ETF 新浪、港股腾讯、现货黄金新浪内盘期货沪金连续 `Au0`、场外基金东财 F10 历史净值）；无真实日线源的分类（如伦敦金 XAU）不写缓存，K 线为空而非合成 |
 | `alert_rules` | 提醒规则 |
 | `alert_events` | 提醒触发记录 |
 | `ai_analyses` | AI 分析历史 |

@@ -916,6 +916,11 @@ func fetchKlineReal(a Asset, limit int) []Candle {
 		}
 		return fetchKlineFund(a, limit)
 	case "stock":
+		// Hong Kong stocks: Sina's getKLineData returns null for hk* codes, so
+		// route them to Tencent's real HK daily feed. A-share / ETF / US stay on Sina.
+		if strings.HasPrefix(sinaCode(a), "hk") {
+			return fetchKlineHK(a, limit)
+		}
 		return fetchKlineSina(a, limit)
 	case "gold":
 		normGoldSubType(&a)
@@ -1094,11 +1099,165 @@ func fetchKlineSina(a Asset, limit int) []Candle {
 	return fetchKlineSinaSymbol(sinaCode(a), limit)
 }
 
-// fetchKlineGoldSpot pulls real daily klines for the SGE Au(T+D) spot gold via
-// Sina's gdsAUTD feed (same code the realtime quote uses, without the
-// underscore). Returns nil on any parse failure — never fabricates a series.
+// fetchKlineHK pulls real daily candles for a Hong Kong stock from Tencent's
+// public fqkline feed. Sina's getKLineData returns null for hk* symbols, so HK
+// history has to come from here.
+//
+// Response shape:
+//
+//	{"code":0,"data":{"hk09866":{"day":[["2026-07-15","39.960","39.580","39.960","38.960","3464432.000"],...]}}}
+//
+// NOTE the column order is [date, OPEN, CLOSE, HIGH, LOW, volume] — close and
+// high/low are NOT in the Sina order. Returns nil on any failure; never fabricates.
+func fetchKlineHK(a Asset, limit int) []Candle {
+	sym := sinaCode(a) // e.g. hk09866 (already zero-padded to 5 digits)
+	if !strings.HasPrefix(sym, "hk") {
+		return nil
+	}
+	url := "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" +
+		sym + ",day,,," + strconv.Itoa(limit) + ",qfq"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "https://gu.qq.com/")
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil
+	}
+	var j struct {
+		Code int `json:"code"`
+		Data map[string]struct {
+			Day    [][]any `json:"day"`
+			QfqDay [][]any `json:"qfqday"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &j); err != nil || j.Code != 0 {
+		return nil
+	}
+	node, ok := j.Data[sym]
+	if !ok {
+		return nil
+	}
+	rows := node.Day
+	if len(rows) == 0 {
+		rows = node.QfqDay // some params return the adjusted series under qfqday
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	candles := make([]Candle, 0, len(rows))
+	for _, r := range rows {
+		if len(r) < 6 {
+			continue
+		}
+		ts, derr := time.ParseInLocation("2006-01-02", strings.TrimSpace(fmt.Sprint(r[0])), time.Local)
+		if derr != nil {
+			continue
+		}
+		open, _ := strconv.ParseFloat(fmt.Sprint(r[1]), 64)
+		close, _ := strconv.ParseFloat(fmt.Sprint(r[2]), 64)
+		high, _ := strconv.ParseFloat(fmt.Sprint(r[3]), 64)
+		low, _ := strconv.ParseFloat(fmt.Sprint(r[4]), 64)
+		vol, _ := strconv.ParseFloat(fmt.Sprint(r[5]), 64)
+		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
+			continue
+		}
+		candles = append(candles, Candle{
+			Ts: ts.UnixMilli(), Open: open, High: high, Low: low, Close: close, Volume: vol,
+		})
+	}
+	return candles
+}
+
+// fetchKlineGoldSpot pulls real daily candles for spot / physical gold priced in
+// CNY per gram. Sina's gdsAUTD symbol has no daily K-line endpoint (getKLineData
+// returns null), so the series comes from the SHFE gold continuous contract
+// (Au0) daily K-line — a real, exchange-published CNY/gram series that tracks the
+// same underlying metal as Au(T+D) / physical gold, so it is the honest choice
+// for a spot-gold trend chart.
+//
+// Response is JSONP guarded by an XSSI comment:
+//
+//	/*<script>location.href='//sina.com';</script>*/
+//	var _=([{"d":"2008-01-09","o":"230.950","h":"230.990","l":"221.880","c":"223.300","v":"103364",...}]);
+//
+// Returns nil on any failure — never fabricates a series.
 func fetchKlineGoldSpot(a Asset, limit int) []Candle {
-	return fetchKlineSinaSymbol("gdsAUTD", limit)
+	return fetchKlineGoldFutures(limit)
+}
+
+// fetchKlineGoldFutures fetches and parses the Au0 (SHFE gold continuous) daily
+// K-line. The upstream ignores any length parameter and always returns the full
+// history back to 2008 (~500KB), so we slice the newest `limit` rows locally.
+func fetchKlineGoldFutures(limit int) []Candle {
+	url := "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_=/InnerFuturesNewService.getDailyKLine?symbol=Au0"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "https://finance.sina.com.cn/futures/quotes/Au0.shtml")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	// Full history is ~500KB today and grows ~250 rows/year; allow 8MB headroom
+	// so the payload is never silently truncated into a parse failure.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil
+	}
+	// Strip the JSONP wrapper: keep everything between the first '[' and last ']'.
+	s := string(raw)
+	lo, hi := strings.Index(s, "["), strings.LastIndex(s, "]")
+	if lo < 0 || hi <= lo {
+		return nil
+	}
+	var rows []struct {
+		D string `json:"d"` // date
+		O string `json:"o"` // open
+		H string `json:"h"` // high
+		L string `json:"l"` // low
+		C string `json:"c"` // close
+		V string `json:"v"` // volume
+	}
+	if err := json.Unmarshal([]byte(s[lo:hi+1]), &rows); err != nil {
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[len(rows)-limit:] // oldest-first upstream: keep the newest tail
+	}
+	candles := make([]Candle, 0, len(rows))
+	for _, r := range rows {
+		ts, derr := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.D), time.Local)
+		if derr != nil {
+			continue
+		}
+		open, _ := strconv.ParseFloat(strings.TrimSpace(r.O), 64)
+		high, _ := strconv.ParseFloat(strings.TrimSpace(r.H), 64)
+		low, _ := strconv.ParseFloat(strings.TrimSpace(r.L), 64)
+		close, _ := strconv.ParseFloat(strings.TrimSpace(r.C), 64)
+		vol, _ := strconv.ParseFloat(strings.TrimSpace(r.V), 64)
+		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
+			continue
+		}
+		candles = append(candles, Candle{
+			Ts: ts.UnixMilli(), Open: open, High: high, Low: low, Close: close, Volume: vol,
+		})
+	}
+	return candles
 }
 
 // Kline returns the most recent `limit` candles for an asset.
