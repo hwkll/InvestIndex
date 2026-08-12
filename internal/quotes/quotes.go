@@ -400,18 +400,30 @@ func fetchCoinGecko(a Asset) *Quote {
 		Currency: "USD", SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
-// fetchTiantian pulls the latest unit NAV for an off-exchange (open-end) fund
-// from Eastmoney's public JSONP endpoint. NOTE: this endpoint was unreachable
-// from the build/sandbox environment during implementation (Eastmoney returns a
-// generic "page not found"); the off-exchange-fund path therefore falls through
-// to "nosource" rather than fabricating a price. Wire it in only once the
-// source is verified reachable in the target deployment.
+// fetchTiantian pulls the latest unit NAV (单位净值) for an off-exchange
+// (open-end) fund from Eastmoney's public F10 history endpoint.
+//
+// Source note: the older realtime-estimate endpoint
+// "fundgz.1234567.com.cn/js/<code>.js" is dead — Eastmoney now serves a generic
+// "页面未找到" HTML page for it regardless of scheme, Referer or cache-buster, so
+// every off-exchange fund silently reported "nosource". It was replaced with
+// api.fund.eastmoney.com/f10/lsjz, which is verified reachable and returns the
+// authoritative published NAV. pageSize=2 fetches the latest plus the previous
+// session so the daily change is computed exactly instead of being derived from
+// a rounded growth rate.
+//
+// Returns nil (caller maps that to "nosource") on any failure or unknown fund
+// code; it never fabricates a price.
 func fetchTiantian(a Asset) *Quote {
 	code := strings.TrimSpace(a.Symbol)
-	url := "https://fundgz.1234567.com.cn/js/" + code + ".js"
+	if code == "" {
+		return nil
+	}
+	url := "https://api.fund.eastmoney.com/f10/lsjz?fundCode=" + code + "&pageIndex=1&pageSize=2"
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	req.Header.Set("Referer", "https://fundgz.1234567.com.cn/")
+	req.Header.Set("Referer", "https://fundf10.eastmoney.com/jjjz_"+code+".html")
+	req.Header.Set("Accept", "application/json")
 	resp, err := httpc.Do(req)
 	if err != nil {
 		return nil
@@ -420,34 +432,54 @@ func fetchTiantian(a Asset) *Quote {
 	if resp.StatusCode != 200 {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16384))
 	if err != nil {
 		return nil
 	}
-	s := string(raw)
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end <= start {
-		return nil
-	}
 	var j struct {
-		Dwjz  string `json:"dwjz"`  // 单位净值
-		Jzzzl string `json:"jzzzl"` // 日增长率 %
+		Data struct {
+			List []struct {
+				FSRQ  string `json:"FSRQ"`  // 净值日期
+				DWJZ  string `json:"DWJZ"`  // 单位净值
+				JZZZL string `json:"JZZZL"` // 日增长率 %
+			} `json:"LSJZList"`
+		} `json:"Data"`
 	}
-	if err := json.Unmarshal([]byte(s[start:end+1]), &j); err != nil {
+	if err := json.Unmarshal(raw, &j); err != nil {
 		return nil
 	}
-	price, err := strconv.ParseFloat(j.Dwjz, 64)
-	if err != nil || price <= 0 || math.IsNaN(price) {
+	list := j.Data.List
+	if len(list) == 0 {
+		return nil // unknown or delisted fund code: no data, no guessing
+	}
+	price, err := strconv.ParseFloat(strings.TrimSpace(list[0].DWJZ), 64)
+	if err != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 		return nil
 	}
-	chg, _ := strconv.ParseFloat(j.Jzzzl, 64)
-	prev := price
-	if chg != 0 {
-		prev = price / (1 + chg/100)
+	// Prefer the previous session's published NAV for an exact change; when only
+	// one row came back (e.g. a brand-new fund) fall back to the reported growth
+	// rate, and report 0 rather than guessing if that is unparseable too.
+	prev, chg := price, 0.0
+	if len(list) > 1 {
+		if p, perr := strconv.ParseFloat(strings.TrimSpace(list[1].DWJZ), 64); perr == nil && p > 0 && !math.IsNaN(p) {
+			prev = p
+			chg = (price/prev - 1) * 100
+		}
+	}
+	if prev == price {
+		if v, verr := strconv.ParseFloat(strings.TrimSpace(list[0].JZZZL), 64); verr == nil && v != 0 {
+			chg = v
+			prev = price / (1 + v/100)
+		}
+	}
+	// NAV is published once per session, so report the NAV date as the source
+	// time instead of "now" — otherwise a stale NAV looks freshly fetched.
+	src := time.Now().UnixMilli()
+	if d, derr := time.ParseInLocation("2006-01-02", strings.TrimSpace(list[0].FSRQ), time.Local); derr == nil {
+		src = d.UnixMilli()
 	}
 	return &Quote{AssetID: a.ID, Price: price, PrevClose: prev, ChgPct: chg,
-		Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: "ok"}
+		Currency: a.Currency, SourceTime: src, Status: "ok"}
 }
 
 // isGoldSpot reports whether a gold asset should be quoted from the SGE/COMEX
