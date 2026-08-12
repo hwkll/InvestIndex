@@ -9,7 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"log"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,25 +41,25 @@ func Init() error {
 }
 
 // Encrypt returns "enc:<base64(iv|tag|ciphertext)>".
-func Encrypt(plain string) string {
+func Encrypt(plain string) (string, error) {
 	if plain == "" {
-		return ""
+		return "", nil
 	}
 	block, err := aes.NewCipher(masterKey)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	iv := make([]byte, gcm.NonceSize())
 	if _, err := rand.Read(iv); err != nil {
-		return ""
+		return "", fmt.Errorf("生成 IV 失败: %w", err) // F-16: 失败即上报，不再静默返回空
 	}
 	// Go's Seal appends the tag; store as iv|ct|tag which we split on read.
 	ct := gcm.Seal(nil, iv, []byte(plain), nil)
-	return "enc:" + base64.StdEncoding.EncodeToString(append(iv, ct...))
+	return "enc:" + base64.StdEncoding.EncodeToString(append(iv, ct...)), nil
 }
 
 // Decrypt reverses Encrypt; plaintext values pass through untouched.
@@ -91,18 +91,16 @@ func Decrypt(stored string) string {
 }
 
 // HashPassword produces "scrypt$<saltHex>$<hashHex>".
-func HashPassword(pin string) string {
+func HashPassword(pin string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
-		log.Printf("[cryptox] rand.Read failed for salt: %v", err)
-		// Continue with zero salt as fallback — better than crashing,
-		// but the resulting hash is weaker.
+		return "", fmt.Errorf("生成 salt 失败: %w", err) // F-16: 不再用零 salt 生产哈希
 	}
 	h, err := scrypt.Key([]byte(pin), salt, 16384, 8, 1, 64)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return "scrypt$" + hex.EncodeToString(salt) + "$" + hex.EncodeToString(h)
+	return "scrypt$" + hex.EncodeToString(salt) + "$" + hex.EncodeToString(h), nil
 }
 
 // VerifyPassword does a constant-time comparison against a stored hash.
@@ -127,12 +125,12 @@ func VerifyPassword(pin, stored string) bool {
 }
 
 // RandomToken returns a hex string of n random bytes.
-func RandomToken(n int) string {
+func RandomToken(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		return ""
+		return "", fmt.Errorf("生成随机令牌失败: %w", err) // F-16: 失败即上报
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // UUID returns a random v4 UUID.

@@ -10,7 +10,7 @@ const app = useApp();
 const DEFAULTS = {
   currency: 'CNY',
   data_source_mode: 'auto',
-  deepseek_model: 'deepseek-chat',
+  deepseek_model: 'deepseek-v4-flash',
   smtp_host: '',
   smtp_port: '587',
   smtp_from: '',
@@ -18,6 +18,8 @@ const DEFAULTS = {
   smtp_tls: '0',
   webhook_url: '',
   benchmark: '',
+  poll_interval: '30',
+  fx_refresh_interval: '1800',
 };
 
 const form = reactive({ ...DEFAULTS, deepseek_api_key: '', smtp_user: '', smtp_pass: '' });
@@ -25,6 +27,7 @@ const saved = reactive({ ...DEFAULTS }); // server state, for diffing
 const keyHasValue = ref(false);
 const smtpUserHasValue = ref(false);
 const smtpPassHasValue = ref(false);
+const whHasValue = ref(false);
 const loading = ref(true);
 const busy = ref(false);
 const showKey = ref(false);
@@ -58,6 +61,7 @@ async function load() {
     keyHasValue.value = !!(s.deepseek_api_key && s.deepseek_api_key.has_value);
     smtpUserHasValue.value = !!(s.smtp_user && s.smtp_user.has_value);
     smtpPassHasValue.value = !!(s.smtp_pass && s.smtp_pass.has_value);
+    whHasValue.value = !!(s.webhook_url && s.webhook_url.has_value);
     await loadFx();
     await loadAssets();
   } catch (e) {
@@ -71,15 +75,25 @@ onMounted(load);
 async function save() {
   busy.value = true;
   try {
+    // Clamp refresh intervals so the persisted value matches the effective one.
+    form.poll_interval = clampNum(form.poll_interval, 5, 600, 30);
+    form.fx_refresh_interval = clampNum(form.fx_refresh_interval, 60, 86400, 1800);
     const body = {};
-    for (const k of Object.keys(DEFAULTS)) body[k] = String(form[k]);
-    // Only send the secret when the user actually typed one, otherwise an empty
-    // field would wipe the stored (encrypted) key.
+    for (const k of Object.keys(DEFAULTS)) {
+      if (k === 'webhook_url') continue; // 单独处理，避免清空已加密原值
+      body[k] = String(form[k]);
+    }
+    // 仅在用户实际输入时才提交敏感字段，空值保留已存储（加密）原值。
+    if (form.webhook_url) body.webhook_url = form.webhook_url;
     if (form.deepseek_api_key) body.deepseek_api_key = form.deepseek_api_key;
     if (form.smtp_user) body.smtp_user = form.smtp_user;
     if (form.smtp_pass) body.smtp_pass = form.smtp_pass;
     await Api.saveSettings(body);
     for (const k of Object.keys(DEFAULTS)) saved[k] = form[k];
+    if (form.webhook_url) {
+      whHasValue.value = true;
+      form.webhook_url = '';
+    }
     if (form.deepseek_api_key) {
       keyHasValue.value = true;
       form.deepseek_api_key = '';
@@ -107,6 +121,15 @@ function reset() {
   form.deepseek_api_key = '';
   form.smtp_user = '';
   form.smtp_pass = '';
+}
+
+/** Coerce a user-entered refresh interval to a finite number within [min,max]. */
+function clampNum(v, min, max, def) {
+  let n = Number(v);
+  if (!Number.isFinite(n)) n = def;
+  if (n < min) n = min;
+  if (n > max) n = max;
+  return n;
 }
 
 /* ---------- AI connectivity test ---------- */
@@ -158,12 +181,19 @@ const fxResult = reactive({ ok: null, msg: '' });
 async function loadFx() {
   try {
     const rows = await Api.fxRates();
-    fxList.value = (rows || []).map((r) => ({ currency: r.currency, rate: r.rate }));
+    fxList.value = (rows || []).map((r) => ({ currency: r.currency, rate: r.rate, auto: !!r.auto, updatedAt: r.updatedAt || 0 }));
   } catch (e) {
     app.toast('汇率加载失败', e.message, 'error');
   } finally {
     fxLoaded.value = true;
   }
+}
+
+function fmtFxTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 async function saveFx() {
@@ -180,6 +210,7 @@ async function saveFx() {
     fxResult.ok = true;
     fxResult.msg = '汇率已保存';
     app.toast('已保存', '多币种汇率已更新', 'success');
+    await loadFx(); // 刷新 auto/updatedAt 状态（保存即锁定为手动）
   } catch (e) {
     fxResult.ok = false;
     fxResult.msg = e.message;
@@ -386,7 +417,7 @@ async function doImport() {
         <div class="set-ico green">◉</div>
         <div>
           <h3>行情数据源</h3>
-          <p>决定持仓价格从哪里获取，每 30 秒刷新一次</p>
+          <p>决定持仓价格从哪里获取，每 {{ Number(form.poll_interval) || 30 }} 秒刷新一次</p>
         </div>
       </header>
 
@@ -403,6 +434,44 @@ async function doImport() {
           <span class="src-desc">{{ s.desc }}</span>
           <span class="src-check">✓</span>
         </button>
+      </div>
+    </section>
+
+    <!-- ============ 刷新频率 ============ -->
+    <section class="set-card">
+      <header class="set-head">
+        <div class="set-ico green">⟳</div>
+        <div>
+          <h3>刷新频率</h3>
+          <p>行情轮询与多币种汇率的刷新间隔；保存后即时生效，无需重启</p>
+        </div>
+      </header>
+
+      <div class="set-row">
+        <div class="rl">
+          <label>行情刷新间隔（秒）</label>
+          <p>多久向数据源轮询一次实时价格并推送行情更新；建议 5–600 秒</p>
+        </div>
+        <div class="rr">
+          <input type="number" min="5" max="600" step="5" class="rate-in" style="width:140px"
+                 v-model.number="form.poll_interval" />
+        </div>
+      </div>
+
+      <div class="set-row">
+        <div class="rl">
+          <label>汇率刷新间隔（秒）</label>
+          <p>多久抓取一次实时汇率（USD/HKD→CNY）；建议 60–86400 秒</p>
+        </div>
+        <div class="rr">
+          <input type="number" min="60" max="86400" step="60" class="rate-in" style="width:140px"
+                 v-model.number="form.fx_refresh_interval" />
+        </div>
+      </div>
+
+      <div class="banner warn" style="margin-top:14px">
+        <span class="bi">!</span>
+        <div>修改后点击右上角「保存更改」即可即时生效：行情轮询与汇率抓取会按新间隔重新计时，当前进程不会重启。</div>
       </div>
     </section>
 
@@ -426,6 +495,11 @@ async function doImport() {
           <tr v-for="(r, i) in fxList" :key="r.currency">
             <td>
               <span class="cur-badge" :class="{ base: r.currency === 'CNY' }">{{ r.currency }}</span>
+              <div v-if="r.currency !== 'CNY'" style="margin-top:4px;font-size:11px">
+                <span :style="r.auto ? 'color:#1a9e5f' : 'color:#999'">{{ r.auto ? '实时' : '已锁定' }}</span>
+                <span class="muted mini" v-if="r.updatedAt"> · {{ fmtFxTime(r.updatedAt) }}</span>
+              </div>
+              <div v-else class="muted mini" style="margin-top:4px">换算枢纽</div>
             </td>
             <td class="num">
               <input
@@ -477,17 +551,24 @@ async function doImport() {
         <div class="set-ico violet">✦</div>
         <div>
           <h3>AI 分析</h3>
-          <p>不填 API Key 也能用——自动回退到本地启发式分析，无需联网</p>
+          <p>需配置 DeepSeek API Key 后方可使用 AI 分析（请选用 V4 系列模型）</p>
+          <div class="note warn" style="margin-top:8px;">
+            ⚠ 数据出境提示：使用 AI 分析时，相关持仓与行情数据将发送至 DeepSeek 境外服务器处理。请确认你已了解并同意该跨境数据传输，仅在合规前提下使用。
+          </div>
         </div>
       </header>
 
       <div class="set-row">
         <div class="rl">
           <label>模型名称</label>
-          <p>DeepSeek 平台的模型标识</p>
+          <p>DeepSeek V4 模型标识（官方已于 2026-07-24 弃用 deepseek-chat）</p>
         </div>
         <div class="rr">
-          <input v-model="form.deepseek_model" placeholder="deepseek-chat" />
+          <input v-model="form.deepseek_model" list="ds-models" placeholder="deepseek-v4-flash" />
+          <datalist id="ds-models">
+            <option value="deepseek-v4-flash">deepseek-v4-flash（高速推理，推荐）</option>
+            <option value="deepseek-v4-pro">deepseek-v4-pro（深度推理）</option>
+          </datalist>
         </div>
       </div>
 
@@ -621,15 +702,19 @@ async function doImport() {
 
       <div class="set-row col">
         <div class="rl">
-          <label>Webhook 地址</label>
+          <label>Webhook 地址
+            <span v-if="whHasValue" style="font-size:12px;color:#16a34a;margin-left:6px;">● 已配置</span>
+            <span v-else style="font-size:12px;color:#94a3b8;margin-left:6px;">○ 未配置</span>
+          </label>
           <p>创建或编辑提醒时，将通道选为「含 Webhook」即可推送到此地址；留空则不使用</p>
         </div>
-        <input v-model="form.webhook_url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx" />
+        <input v-model="form.webhook_url"
+               :placeholder="whHasValue ? '已保存，留空则不修改' : 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'" />
       </div>
 
       <div class="set-row col">
         <div class="rr auto" style="width: auto;">
-          <button class="btn ghost2" :disabled="whBusy || !form.webhook_url" @click="testWebhook">
+          <button class="btn ghost2" :disabled="whBusy || (!form.webhook_url && !whHasValue)" @click="testWebhook">
             <span v-if="whBusy" class="spin"></span>{{ whBusy ? ' 发送中' : '发送测试消息' }}
           </button>
         </div>
@@ -637,7 +722,7 @@ async function doImport() {
         <div v-else-if="whResult.ok === false" class="note bad">✗ {{ whResult.msg }}</div>
       </div>
 
-      <div v-if="!form.webhook_url" class="banner warn">
+      <div v-if="!whHasValue" class="banner warn">
         <span class="bi">!</span>
         <div>尚未配置 Webhook 地址。配置后在「提醒」页把规则通道设为含 Webhook 即可启用多渠道推送。</div>
       </div>

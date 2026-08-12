@@ -147,12 +147,22 @@ const indRows = computed(() => {
 });
 
 async function analyze() {
+  if (!localStorage.getItem('ih_ai_egress_ack')) {
+    if (!confirm('数据出境提示：AI 分析会将相关持仓与行情数据发送至 DeepSeek 境外服务器处理。确认你已了解并同意该跨境数据传输？')) {
+      return;
+    }
+    localStorage.setItem('ih_ai_egress_ack', '1');
+  }
   analyzing.value = true;
   try {
     const r = await Api.analyze({ scope: 'asset', assetId: id.value });
     analysis.value = { ...r, conclusion: r.conclusion, createdAt: r.createdAt, model: r.model };
     if (r.degraded) app.toast('已降级为本地分析', r.notice || '', 'alert');
   } catch (e) {
+    if (e.code === 40301) {
+      app.toast('需要配置', '请先在「设置 → AI 分析」配置 DeepSeek API Key 后重试', 'alert');
+      return;
+    }
     app.toast('分析失败', e.message, 'error');
   } finally {
     analyzing.value = false;
@@ -225,6 +235,16 @@ async function analyze() {
               <div class="muted">置信度 {{ ((analysis.conclusion.confidence || 0) * 100).toFixed(0) }}% · {{ analysis.model }}</div>
             </div>
             <div class="bar mt8"><i :style="{ width: ((analysis.conclusion.confidence || 0) * 100) + '%' }"></i></div>
+            <div class="flex mt12" style="gap:18px" v-if="analysis.conclusion.currentPrice || analysis.conclusion.targetPrice">
+              <div v-if="analysis.conclusion.currentPrice" style="display:flex;flex-direction:column;gap:2px">
+                <span class="muted" style="font-size:12px">当前价</span>
+                <b class="num">{{ price(analysis.conclusion.currentPrice) }}</b>
+              </div>
+              <div v-if="analysis.conclusion.targetPrice" style="display:flex;flex-direction:column;gap:2px">
+                <span class="muted" style="font-size:12px">目标价</span>
+                <b class="num up">{{ price(analysis.conclusion.targetPrice) }}</b>
+              </div>
+            </div>
             <p class="mt12" style="line-height: 1.7">{{ analysis.conclusion.summary }}</p>
             <div v-if="analysis.conclusion.reasons?.length">
               <div class="muted mt8">主要理由</div>

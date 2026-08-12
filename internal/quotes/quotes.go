@@ -28,7 +28,7 @@ type Quote struct {
 	ChgPct     float64 `json:"chgPct"`
 	Currency   string  `json:"currency"`
 	SourceTime int64   `json:"sourceTime"`
-	Status     string  `json:"status"` // ok | sim | stale
+	Status     string  `json:"status"` // ok | nosource | sim (sim only in explicit sim mode)
 }
 
 // Candle is one K-line bar.
@@ -152,7 +152,12 @@ func activeAssets() []Asset {
 	return out
 }
 
-// SeedState primes the in-memory cache for every active asset.
+// SeedState primes the in-memory cache for every active asset. The live quote
+// is seeded as "nosource" (price 0) rather than a last-snapshot/DefaultPrice
+// value: between process start and the first PollAll, a fabricated number
+// presented as a live quote is worse than showing nothing. The simulator state
+// is still primed from the last snapshot (or DefaultPrice) so K-line backfill
+// and explicit sim mode keep a sensible starting point.
 func SeedState() {
 	for _, a := range activeAssets() {
 		mu.RLock()
@@ -169,7 +174,6 @@ func SeedState() {
 		if vol == 0 {
 			vol = 0.01
 		}
-		initChg := (rand.Float64()*2 - 1) * vol * 8
 		mu.Lock()
 		// Re-check: another goroutine may have added it between the RUnlock and Lock.
 		if _, doubleCheck := cache[a.ID]; doubleCheck {
@@ -178,18 +182,20 @@ func SeedState() {
 		}
 		sim[a.ID] = &simState{price: price, vol: vol}
 		cache[a.ID] = &Quote{
-			AssetID: a.ID, Price: price, PrevClose: price / (1 + initChg),
-			ChgPct: initChg * 100, Currency: a.Currency,
-			SourceTime: time.Now().UnixMilli(), Status: "sim",
+			AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
+			Currency: a.Currency, SourceTime: 0, Status: "nosource",
 		}
 		mu.Unlock()
 	}
 }
 
 // AddAsset registers a freshly created asset with the quote layer. It seeds a
-// simulator quote so the asset is never "unknown"; the API handler is
+// neutral "nosource" entry (price 0) so the asset is never "unknown" and never
+// flashes a fabricated number before its first real fetch; the API handler is
 // responsible for pulling a real quote (and backfilling K-line) right after
-// creation. Idempotent: re-adding an existing asset is a no-op.
+// creation. The simState is still primed from DefaultPrice so explicit sim mode
+// and K-line backfill keep a sensible starting point.
+// Idempotent: re-adding an existing asset is a no-op.
 func AddAsset(a Asset) {
 	mu.RLock()
 	if _, exists := cache[a.ID]; exists {
@@ -202,13 +208,11 @@ func AddAsset(a Asset) {
 	if vol == 0 {
 		vol = 0.01
 	}
-	initChg := (rand.Float64()*2 - 1) * vol * 8
 	mu.Lock()
 	sim[a.ID] = &simState{price: price, vol: vol}
 	cache[a.ID] = &Quote{
-		AssetID: a.ID, Price: price, PrevClose: price / (1 + initChg),
-		ChgPct: initChg * 100, Currency: a.Currency,
-		SourceTime: time.Now().UnixMilli(), Status: "sim",
+		AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
+		Currency: a.Currency, SourceTime: 0, Status: "nosource",
 	}
 	mu.Unlock()
 }
@@ -250,7 +254,13 @@ func HasProvider(a Asset) bool {
 func fetchReal(a Asset) *Quote {
 	switch a.Category {
 	case "crypto":
-		return fetchBinance(a)
+		// Binance is the primary source; CoinGecko is a second real source so a
+		// geo-blocked/unreachable Binance still yields a TRUE price instead of
+		// degrading to a fabricated one.
+		if q := fetchBinance(a); q != nil {
+			return q
+		}
+		return fetchCoinGecko(a)
 	case "stock":
 		return fetchSina(a)
 	case "fund":
@@ -259,10 +269,17 @@ func fetchReal(a Asset) *Quote {
 		}
 		return fetchTiantian(a)
 	case "gold":
-		if isSpotGold(a) {
-			return fetchSinaSpot(a)
+		// Normalize legacy subType values (e.g. "实物金"/"纸黄金"/"现货") typed
+		// by users before the enum was fixed, so they still resolve to a spot
+		// price instead of being treated as an ETF.
+		normGoldSubType(&a)
+		if a.SubType == "etf" {
+			return fetchSina(a) // on-exchange gold ETF, CNY/share
 		}
-		return fetchSina(a)
+		if isXAU(a) {
+			return fetchSinaXAU(a) // international London gold, USD/ounce
+		}
+		return fetchSinaSpot(a) // physical / paper / SGE Au(T+D), CNY/gram
 	}
 	return nil
 }
@@ -312,6 +329,77 @@ func fetchBinance(a Asset) *Quote {
 		Currency: "USD", SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
+// coinGeckoIDs maps our ticker convention to CoinGecko coin ids. Unknown
+// symbols are skipped (we never guess an id — a wrong id would return a wrong
+// coin's price, which is worse than no price at all).
+var coinGeckoIDs = map[string]string{
+	"BTC":   "bitcoin",
+	"ETH":   "ethereum",
+	"DOGE":  "dogecoin",
+	"BNB":   "binancecoin",
+	"XRP":   "ripple",
+	"SOL":   "solana",
+	"ADA":   "cardano",
+	"DOT":   "polkadot",
+	"LTC":   "litecoin",
+	"LINK":  "chainlink",
+	"MATIC": "matic-network",
+	"TRX":   "tron",
+	"AVAX":  "avalanche-2",
+	"UNI":   "uniswap",
+	"ATOM":  "cosmos",
+	"XLM":   "stellar",
+	"BCH":   "bitcoin-cash",
+	"ETC":   "ethereum-classic",
+	"NEAR":  "near",
+	"APT":   "aptos",
+	"ARB":   "arbitrum",
+	"OP":    "optimism",
+	"TON":   "the-open-network",
+	"PEPE":  "pepe",
+	"SHIB":  "shiba-inu",
+	"WIF":   "dogwifcoin",
+}
+
+// coinGeckoID resolves an asset symbol to a CoinGecko coin id ("" when unknown).
+func coinGeckoID(a Asset) string {
+	s := strings.ToUpper(strings.TrimSpace(a.Symbol))
+	s = strings.TrimSuffix(s, "USDT")
+	return coinGeckoIDs[s]
+}
+
+// fetchCoinGecko pulls a spot USD price from CoinGecko's public simple/price
+// endpoint. Returns nil on any failure so the caller can fall through to
+// "nosource". CoinGecko's simple endpoint carries no previous close, so
+// PrevClose mirrors the price and ChgPct is reported as 0 rather than guessed.
+func fetchCoinGecko(a Asset) *Quote {
+	id := coinGeckoID(a)
+	if id == "" {
+		return nil
+	}
+	url := "https://api.coingecko.com/api/v3/simple/price?ids=" + id + "&vs_currencies=usd"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var j map[string]map[string]float64
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&j); err != nil {
+		return nil
+	}
+	price, ok := j[id]["usd"]
+	if !ok || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return nil
+	}
+	return &Quote{AssetID: a.ID, Price: price, PrevClose: price, ChgPct: 0,
+		Currency: "USD", SourceTime: time.Now().UnixMilli(), Status: "ok"}
+}
+
 // fetchTiantian pulls the latest unit NAV for an off-exchange (open-end) fund
 // from Eastmoney's public JSONP endpoint. NOTE: this endpoint was unreachable
 // from the build/sandbox environment during implementation (Eastmoney returns a
@@ -320,10 +408,10 @@ func fetchBinance(a Asset) *Quote {
 // source is verified reachable in the target deployment.
 func fetchTiantian(a Asset) *Quote {
 	code := strings.TrimSpace(a.Symbol)
-	url := "http://fundgz.1234567.com.cn/js/" + code + ".js"
+	url := "https://fundgz.1234567.com.cn/js/" + code + ".js"
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	req.Header.Set("Referer", "http://fundgz.1234567.com.cn/")
+	req.Header.Set("Referer", "https://fundgz.1234567.com.cn/")
 	resp, err := httpc.Do(req)
 	if err != nil {
 		return nil
@@ -362,18 +450,72 @@ func fetchTiantian(a Asset) *Quote {
 		Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
-// isSpotGold reports whether a gold asset should use the SGE spot quote
-// (gds_AUTD, CNY/gram) instead of the on-exchange gold-ETF quote (Sina A-share).
-func isSpotGold(a Asset) bool {
+// isGoldSpot reports whether a gold asset should be quoted from the SGE/COMEX
+// spot market (CNY/gram or USD/ounce) instead of being treated as an on-exchange
+// gold ETF (Sina A-share, CNY/share).
+//
+// Blacklist logic (the previous whitelist was inverted and caused any
+// user-typed subType — e.g. "实物金" — to fall through to the Sina A-share
+// path and report "nosource"): a gold asset is a spot/physical holding UNLESS
+// its subType explicitly marks it as an ETF. This guarantees the common case
+// (physical gold, paper gold, SGE Au(T+D), XAU/USD) always resolves to a real
+// spot price and never silently degrades to "nosource".
+func isGoldSpot(a Asset) bool {
 	if a.Category != "gold" {
 		return false
 	}
-	switch a.SubType {
-	case "spot", "xau", "sge", "autd":
+	return a.SubType != "etf"
+}
+
+// isXAU reports whether a gold asset is the international London-gold (XAU/USD,
+// quoted in USD per ounce) rather than the domestic SGE spot (CNY/gram).
+func isXAU(a Asset) bool {
+	if a.Category != "gold" {
+		return false
+	}
+	if a.SubType == "xau" {
 		return true
 	}
 	s := strings.ToUpper(strings.TrimSpace(a.Symbol))
-	return s == "XAU" || s == "AU9999" || s == "AU99.99" || strings.Contains(s, "XAU")
+	return s == "XAU" || s == "XAUUSD" || strings.Contains(s, "XAU")
+}
+
+// fetchSinaXAU pulls the international spot gold (London gold / XAU) quote from
+// Sina's hf_XAU feed, quoted in USD per ounce.
+func fetchSinaXAU(a Asset) *Quote {
+	req, _ := http.NewRequest("GET", "https://hq.sinajs.cn/?list=hf_XAU", nil)
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return nil
+	}
+	m := sinaRe.FindStringSubmatch(decodeGBK(raw))
+	if len(m) < 2 || m[1] == "" {
+		return nil
+	}
+	f := strings.Split(m[1], ",")
+	if len(f) < 4 {
+		return nil
+	}
+	price, err := strconv.ParseFloat(f[0], 64) // 最新价 (USD/oz)
+	if err != nil || price <= 0 || math.IsNaN(price) {
+		return nil
+	}
+	prev, _ := strconv.ParseFloat(f[3], 64) // 昨收
+	if prev <= 0 {
+		prev = price
+	}
+	return &Quote{AssetID: a.ID, Price: price, PrevClose: prev,
+		ChgPct: (price/prev - 1) * 100, Currency: "USD",
+		SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
 // fetchSinaSpot pulls the Shanghai Gold Exchange Au(T+D) quote from Sina, which
@@ -414,11 +556,90 @@ func fetchSinaSpot(a Asset) *Quote {
 		SourceTime: time.Now().UnixMilli(), Status: "ok"}
 }
 
+// ---- FX rates (live USD/HKD → CNY) --------------------------------------
+
+// RefreshFX fetches live USD→CNY (and HKD→CNY) from Sina and writes them into
+// the fx_rates table. Best-effort: network or parse failures leave the existing
+// rates untouched. User-locked rates (auto=0, set via Settings) are never
+// overwritten.
+func RefreshFX() {
+	now := time.Now().UnixMilli()
+	setFx := func(ccy string, rate float64) {
+		if rate <= 0 || math.IsNaN(rate) {
+			return
+		}
+		if _, err := store.Exec(`UPDATE fx_rates SET rate=?, updated_at=? WHERE currency=? AND auto=1`, rate, now, ccy); err != nil {
+			log.Printf("[fx] update %s failed: %v", ccy, err)
+		} else {
+			log.Printf("[fx] %s -> %.4f CNY (live)", ccy, rate)
+		}
+	}
+
+	// USD → CNY: the anchor rate for any non-CNY asset.
+	if usd := fetchSinaFxRate("fx_susdcny", 5, 9); usd > 0 {
+		setFx("USD", usd)
+		// HKD → CNY: Sina's HKD pair is often empty on this feed, so fall back
+		// to the USD peg (HKD is linked to USD at ~7.80; accurate enough for
+		// display). Only overwrites the auto-managed HKD row.
+		if hkd := fetchSinaFxRate("fx_hkdcny", 0.6, 1.2); hkd > 0 {
+			setFx("HKD", hkd)
+		} else {
+			setFx("HKD", usd/7.80)
+		}
+	} else {
+		log.Printf("[fx] USD rate unavailable, skipping FX refresh")
+	}
+}
+
+// fetchSinaFxRate fetches a Sina forex symbol and returns the first numeric
+// field within [lo, hi] (the sane range for that pair). Returns 0 if none.
+func fetchSinaFxRate(symbol string, lo, hi float64) float64 {
+	req, _ := http.NewRequest("GET", "https://hq.sinajs.cn/?list="+symbol, nil)
+	req.Header.Set("Referer", "https://finance.sina.com.cn/")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return 0
+	}
+	m := sinaRe.FindStringSubmatch(decodeGBK(raw))
+	if len(m) < 2 || m[1] == "" {
+		return 0
+	}
+	for _, part := range strings.Split(m[1], ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil || math.IsNaN(v) {
+			continue
+		}
+		if v >= lo && v <= hi {
+			return v
+		}
+	}
+	return 0
+}
+
 var sinaRe = regexp.MustCompile(`"([^"]*)"`)
 
-// sinaCode maps our symbol convention (sh.600519 / 510300) to Sina's (sh600519).
+// sinaCode maps our symbol convention (sh.600519 / 510300 / 9866.HK) to Sina's
+// (sh600519 / hk09866).
 func sinaCode(a Asset) string {
 	s := strings.ToLower(strings.TrimSpace(a.Symbol))
+	// Hong Kong: accept prefix "hk09866" OR suffix "9866.hk". Sina wants a
+	// 5-digit zero-padded code, e.g. hk09866.
+	if strings.HasPrefix(s, "hk") && isDigits(s[2:]) {
+		return normalizeHK(s[2:])
+	}
+	if dot := strings.LastIndex(s, "."); dot >= 0 {
+		if s[dot+1:] == "hk" && isDigits(s[:dot]) {
+			return normalizeHK(s[:dot])
+		}
+	}
 	s = strings.ReplaceAll(s, ".", "")
 	if strings.HasPrefix(s, "sh") || strings.HasPrefix(s, "sz") ||
 		strings.HasPrefix(s, "hk") || strings.HasPrefix(s, "gb_") {
@@ -438,6 +659,14 @@ func sinaCode(a Asset) string {
 	return ""
 }
 
+// normalizeHK zero-pads a raw HK numeric code to Sina's 5-digit form.
+func normalizeHK(code string) string {
+	for len(code) < 5 {
+		code = "0" + code
+	}
+	return "hk" + code
+}
+
 func isDigits(s string) bool {
 	for _, c := range s {
 		if c < '0' || c > '9' {
@@ -445,6 +674,29 @@ func isDigits(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+// normGoldSubType maps free-form / legacy gold subType values onto the fixed
+// enum {physical, sge, xau, etf}. Anything unrecognized (including empty and
+// user-typed "实物金"/"纸黄金"/"现货") collapses to "physical" so the asset
+// still resolves to a spot price. Only an explicit "etf" is treated as an
+// on-exchange gold ETF.
+func normGoldSubType(a *Asset) {
+	switch strings.ToLower(strings.TrimSpace(a.SubType)) {
+	case "etf", "基金", "etf基金", "黄金etf":
+		a.SubType = "etf"
+	case "xau", "伦敦金", "国际金", "xauusd":
+		a.SubType = "xau"
+	case "sge", "autd", "au(t+d)", "au9999", "au99.99", "金交所", "递延":
+		a.SubType = "sge"
+	case "physical", "实物金", "纸黄金", "现货", "积存金", "金条", "金豆":
+		a.SubType = "physical"
+	default:
+		// empty or any unrecognized value → safe default: physical spot
+		if a.SubType == "" || (a.Category == "gold" && a.SubType != "etf") {
+			a.SubType = "physical"
+		}
+	}
 }
 
 // SubTypeIsUS reports whether the symbol looks like a US ticker.
@@ -566,7 +818,8 @@ func UpdateOne(a Asset) *Quote {
 		// than fabricating a simulator price that would pollute PnL.
 		q = &Quote{AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
 			Currency: a.Currency, SourceTime: 0, Status: "nosource"}
-	} else {
+	} else if m == "sim" {
+		// Explicit simulator mode: generate a synthetic price (offline/demo use).
 		if sim[a.ID] == nil {
 			vol := simVol[a.Category]
 			if vol == 0 {
@@ -587,12 +840,13 @@ func UpdateOne(a Asset) *Quote {
 		if prev > 0 {
 			chg = (price/prev - 1) * 100
 		}
-		status := "sim"
-		if m == "real" {
-			status = "stale" // real was requested but unavailable
-		}
 		q = &Quote{AssetID: a.ID, Price: price, PrevClose: prev, ChgPct: chg,
-			Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: status}
+			Currency: a.Currency, SourceTime: time.Now().UnixMilli(), Status: "sim"}
+	} else {
+		// Auto/real mode but no usable real price: report honestly as "nosource"
+		// instead of fabricating a simulator price that would pollute PnL/display.
+		q = &Quote{AssetID: a.ID, Price: 0, PrevClose: 0, ChgPct: 0,
+			Currency: a.Currency, SourceTime: 0, Status: "nosource"}
 	}
 	cache[a.ID] = q
 	c := *q
@@ -645,8 +899,11 @@ func PersistPrices() {
 	defer mu.RUnlock()
 	now := time.Now().UnixMilli()
 	for id, q := range cache {
-		if q.Status == "sim" {
-			continue // never persist fabricated prices
+		if q.Status == "sim" || q.Status == "nosource" {
+			// Never persist fabricated prices, and never persist price=0
+			// placeholders (a 0 row is not a price and would only pollute
+			// snapshot history / seeding).
+			continue
 		}
 		_, _ = store.Exec(`INSERT INTO price_snapshots(id, asset_id, price, currency, source_time, status, created_at) VALUES(?,?,?,?,?,?,?)`,
 			cryptox.UUID(), id, q.Price, q.Currency, q.SourceTime, q.Status, now)

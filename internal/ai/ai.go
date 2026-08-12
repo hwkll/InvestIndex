@@ -1,11 +1,14 @@
-// Package ai builds analysis context, calls DeepSeek when configured and falls
-// back to a deterministic heuristic engine so the feature always returns a result.
+// Package ai builds analysis context and calls DeepSeek for analysis. A valid
+// DeepSeek API Key is required; when the key is missing or the call fails,
+// Analyze returns an error (ErrNotConfigured or the call error) so the UI can
+// surface the failure instead of producing a degraded / fake analysis.
 package ai
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -23,6 +26,10 @@ import (
 
 // limiter caps concurrent analyses (PRD: max 2 in flight).
 var limiter = make(chan struct{}, 2)
+
+// ErrNotConfigured is returned by Analyze when no DeepSeek API Key is set, so the
+// caller can show a configuration prompt instead of a (fake) analysis.
+var ErrNotConfigured = errors.New("未配置 DeepSeek API Key，请在设置中配置后使用 AI 分析")
 
 // Indicators is the flattened technical snapshot handed to the model / UI.
 type Indicators struct {
@@ -111,12 +118,14 @@ type Action struct {
 
 // Conclusion is the structured model output.
 type Conclusion struct {
-	Signal     string   `json:"signal"`
-	Confidence float64  `json:"confidence"`
-	Summary    string   `json:"summary"`
-	Reasons    []string `json:"reasons"`
-	Risks      []string `json:"risks"`
-	Actions    []Action `json:"actions"`
+	Signal       string   `json:"signal"`
+	Confidence   float64  `json:"confidence"`
+	Summary      string   `json:"summary"`
+	Reasons      []string `json:"reasons"`
+	Risks        []string `json:"risks"`
+	Actions      []Action `json:"actions"`
+	CurrentPrice *float64 `json:"currentPrice,omitempty"` // filled from our quote data (asset scope only)
+	TargetPrice  *float64 `json:"targetPrice,omitempty"`  // AI-provided expected price, given when signal is buy
 }
 
 // Result is what the API returns for one analysis run.
@@ -179,176 +188,20 @@ func buildGlobalContext() map[string]any {
 	}
 }
 
-// ---- heuristic engine ---------------------------------------------------
-
-var signalCN = map[string]string{"buy": "买入/加仓", "sell": "卖出/减仓", "hold": "持有", "watch": "观望"}
-
-func heuristicAsset(ctx map[string]any) Conclusion {
-	ind, _ := ctx["indicators"].(*Indicators)
-	pos, _ := ctx["position"].(map[string]any)
-	asset, _ := ctx["asset"].(map[string]any)
-
-	score := 0.0
-	reasons := []string{}
-	risks := []string{}
-	actions := []Action{}
-
-	if ind != nil {
-		if ind.RSI != nil {
-			switch {
-			case *ind.RSI > 70:
-				score--
-				reasons = append(reasons, fmt.Sprintf("RSI=%.1f 处于超买区，短期回调风险较高", *ind.RSI))
-			case *ind.RSI < 30:
-				score++
-				reasons = append(reasons, fmt.Sprintf("RSI=%.1f 处于超卖区，存在反弹机会", *ind.RSI))
-			default:
-				reasons = append(reasons, fmt.Sprintf("RSI=%.1f 处于中性区间", *ind.RSI))
-			}
-		}
-		if ind.MACDHist != nil {
-			if *ind.MACDHist > 0 {
-				score++
-				reasons = append(reasons, "MACD 柱状图为正，短期动能偏多")
-			} else {
-				score -= 0.5
-				reasons = append(reasons, "MACD 柱状图为负，短期动能偏弱")
-			}
-		}
-		if ind.KdjJ != nil {
-			if *ind.KdjJ > 100 {
-				reasons = append(reasons, fmt.Sprintf("KDJ J=%.1f 高位，注意高位钝化", *ind.KdjJ))
-			} else if *ind.KdjJ < 0 {
-				reasons = append(reasons, fmt.Sprintf("KDJ J=%.1f 低位，存在反弹动能", *ind.KdjJ))
-			}
-		}
-		if ind.MA != nil && ind.MA["ma5"] != nil && ind.MA["ma20"] != nil {
-			if *ind.MA["ma5"] > *ind.MA["ma20"] {
-				score += 0.5
-				reasons = append(reasons, "MA5 上穿 MA20，短期均线多头排列")
-			} else {
-				score -= 0.3
-				reasons = append(reasons, "MA5 位于 MA20 下方，短期均线偏空")
-			}
-		}
-	}
-
-	qty := 0.0
-	if pos != nil {
-		if q, ok := pos["qty"].(float64); ok {
-			qty = q
-		}
-		if fp, ok := pos["floatingPct"].(*float64); ok && fp != nil {
-			if *fp > 0.3 {
-				score -= 0.3
-				reasons = append(reasons, fmt.Sprintf("当前浮盈 %.1f%%，可考虑分批止盈", *fp*100))
-			} else if *fp < -0.2 {
-				reasons = append(reasons, fmt.Sprintf("当前浮亏 %.1f%%，若基本面未恶化建议持有等待", *fp*100))
-			}
-		}
-	}
-
-	signal := "hold"
-	switch {
-	case score >= 1.2:
-		signal = "buy"
-	case score <= -1.2:
-		signal = "sell"
-	case score < -0.3:
-		signal = "watch"
-	}
-	confidence := math.Min(0.9, 0.5+math.Abs(score)*0.15)
-
-	risks = append(risks, "市场波动与流动性风险；本结论为模型估算，不构成投资建议")
-	name := ""
-	if asset != nil {
-		if n, ok := asset["name"].(string); ok {
-			name = n
-		}
-		if c, ok := asset["category"].(string); ok && c == "crypto" {
-			risks = append(risks, "加密货币波动极大，单日涨跌可能超过 20%")
-		}
-	}
-	switch signal {
-	case "buy":
-		verb := "建仓"
-		if qty > 0 {
-			verb = "加仓"
-		}
-		actions = append(actions, Action{Action: verb, Suggestion: "可在当前价附近分批买入，单次不超过总仓位的 10%"})
-	case "sell":
-		actions = append(actions, Action{Action: "减仓", Suggestion: "可考虑减持，设置止损位保护利润"})
-	case "watch":
-		actions = append(actions, Action{Action: "观望", Suggestion: "等待更明确的信号再行动"})
-	default:
-		actions = append(actions, Action{Action: "持有", Suggestion: "维持现有仓位，关注指标变化"})
-	}
-	return Conclusion{
-		Signal: signal, Confidence: math.Round(confidence*100) / 100,
-		Summary: fmt.Sprintf("%s 当前信号：%s，综合技术面评分 %.2f。", name, signalCN[signal], score),
-		Reasons: reasons, Risks: risks, Actions: actions,
-	}
-}
-
-func heuristicGlobal(ctx map[string]any) Conclusion {
-	cats, _ := ctx["categories"].(map[string]any)
-	bull, bear := 0, 0
-	parts := []string{}
-	names := map[string]string{"crypto": "加密货币", "fund": "基金", "gold": "黄金", "stock": "股票"}
-	for _, c := range core.Categories {
-		m, _ := cats[c].(map[string]any)
-		if m == nil {
-			continue
-		}
-		cnt, _ := m["count"].(int)
-		if cnt == 0 {
-			continue
-		}
-		fp, _ := m["floatingPct"].(*float64)
-		if fp == nil {
-			continue
-		}
-		if *fp > 0.05 {
-			bull++
-		}
-		if *fp < -0.05 {
-			bear++
-		}
-		parts = append(parts, fmt.Sprintf("%s 收益 %.1f%%", names[c], *fp*100))
-	}
-	signal := "hold"
-	if bear > bull && bull == 0 {
-		signal = "watch"
-	}
-	retStr := "暂无收益数据"
-	if tr, ok := ctx["totalReturn"].(*float64); ok && tr != nil {
-		retStr = fmt.Sprintf("收益率 %.2f%%", *tr*100)
-	}
-	dayPnl, _ := ctx["dayPnl"].(float64)
-	body := "暂无持仓"
-	if len(parts) > 0 {
-		body = strings.Join(parts, "，")
-	}
-	summary := fmt.Sprintf("组合整体%s，今日盈亏 %+.2f。各分类：%s。", retStr, dayPnl, body)
-	reasons := []string{summary}
-	total, _ := ctx["totalAssets"].(float64)
-	cash, _ := ctx["cashTotal"].(float64)
-	if total > 0 && cash/total > 0.4 {
-		reasons = append(reasons, fmt.Sprintf("现金占比偏高（%.0f%%），可关注仓位再平衡机会", cash/total*100))
-	}
-	return Conclusion{
-		Signal: signal, Confidence: 0.55, Summary: summary, Reasons: reasons,
-		Risks:   []string{"组合集中风险与单一资产波动；本结论不构成投资建议"},
-		Actions: []Action{{Action: "持有", Suggestion: "维持战略配置，定期再平衡"}},
-	}
-}
-
 // ---- DeepSeek -----------------------------------------------------------
 
-const sysPrompt = `你是一名严谨的投资分析师。基于用户持仓与市场上下文给出决策建议。` +
-	`必须严格返回 JSON：{"signal":"buy|sell|hold|watch","confidence":0.0-1.0,"summary":"一句话总结",` +
-	`"reasons":["理由"],"risks":["风险"],"actions":[{"action":"加仓/减仓/清仓/持有/止损","suggestion":"具体建议"}]}。` +
-	`不要输出 JSON 以外的任何内容。`
+const sysPrompt = `你是一名严谨、专业的投资分析师，服务于个人投资管理工具 InvestHub。` +
+	`请基于用户提供的「持仓、行情与技术指标」上下文，给出客观、可执行的投资决策建议。` +
+	`` +
+	`重要约束：` +
+	`1. 当前真实时间（北京时间 UTC+8）为：{{now}}。所有涉及"今天 / 本周 / 近期 / 过去 N 天"的判断，都必须以此时间为准，严禁使用你训练知识里的时间。` +
+	`2. 你只能依据上下文中给出的数据进行分析，不得臆造上下文中不存在的指标或数值。` +
+	`3. 必须且只能返回如下 JSON，不要输出任何额外文字、Markdown 代码块或解释：` +
+	`{"signal":"buy|sell|hold|watch","confidence":0.0-1.0,"summary":"一句话结论","reasons":["支撑理由，尽量结合具体数值"],"risks":["主要风险点"],"actions":[{"action":"加仓|减仓|清仓|持有|止损|观望","suggestion":"具体、可执行的建议"}],"targetPrice":数值或null}` +
+	`4. signal 必须从给定枚举中选取；confidence 为 0~1 之间的置信度，数值越高代表判断越明确。` +
+	`5. 风险提示中必须包含：本结论由 AI 模型生成，不构成任何投资建议。` +
+	`6. 若上下文数据不足（如无可交易持仓、缺少技术指标），请如实说明，不要强行给出买卖信号，可将 signal 设为 "hold" 并在 reasons 中解释原因。` +
+	`7. 上下文已提供该标的的当前价（quote.price）。当 signal 为 "buy" 时，必须在 JSON 中给出 targetPrice（建议的目标/预期买入价位，单位与 quote.price 一致，须为大于 0 的数值，并明显区别于当前价）；若 signal 不是 "buy"，targetPrice 可省略或置为 null。`
 
 // deepseekClient is reused across calls to avoid TCP connection churn.
 var deepseekClient = &http.Client{Timeout: 60 * time.Second}
@@ -356,18 +209,20 @@ var deepseekClient = &http.Client{Timeout: 60 * time.Second}
 func callDeepSeek(ctx context.Context, ctxData any, model string) (*Conclusion, string, error) {
 	key := settings.Get("deepseek_api_key")
 	if key == "" {
-		return nil, "", nil // not configured => caller uses heuristic
+		return nil, "", ErrNotConfigured
 	}
 	if model == "" {
-		model = settings.GetDefault("deepseek_model", "deepseek-chat")
+		model = settings.GetDefault("deepseek_model", "deepseek-v4-flash")
 	}
+	now := time.Now().Format("2006-01-02 15:04:05 (UTC+8 北京时间)")
+	sysContent := strings.ReplaceAll(sysPrompt, "{{now}}", now)
 	ctxJSON, _ := json.Marshal(ctxData)
 	body, _ := json.Marshal(map[string]any{
 		"model":       model,
 		"temperature": 0.3,
 		"messages": []map[string]string{
-			{"role": "system", "content": "你是投资分析助手，只输出结构化 JSON。"},
-			{"role": "user", "content": sysPrompt + "\n上下文：" + string(ctxJSON)},
+			{"role": "system", "content": sysContent},
+			{"role": "user", "content": "以下是分析所需的上下文数据（JSON 格式）：\n" + string(ctxJSON)},
 		},
 		"response_format": map[string]string{"type": "json_object"},
 	})
@@ -421,6 +276,11 @@ func normalize(c *Conclusion) *Conclusion {
 		c.Signal = "hold"
 	}
 	c.Confidence = math.Max(0, math.Min(1, c.Confidence))
+	if c.TargetPrice != nil {
+		if math.IsNaN(*c.TargetPrice) || *c.TargetPrice <= 0 {
+			c.TargetPrice = nil
+		}
+	}
 	if c.Reasons == nil {
 		c.Reasons = []string{}
 	}
@@ -436,6 +296,9 @@ func normalize(c *Conclusion) *Conclusion {
 // Analyze runs one analysis (global or per-asset) and persists it.
 // ctx allows the HTTP handler to cancel the request when the client disconnects.
 func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error) {
+	if settings.Get("deepseek_api_key") == "" {
+		return nil, ErrNotConfigured
+	}
 	select {
 	case limiter <- struct{}{}:
 	case <-ctx.Done():
@@ -456,19 +319,24 @@ func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error)
 		ctxData = buildGlobalContext()
 	}
 
-	var conclusion Conclusion
-	usedModel := "heuristic"
-	degraded := false
-	notice := ""
+	c, m, cerr := callDeepSeek(ctx, ctxData, model)
+	if cerr != nil {
+		return nil, fmt.Errorf("AI 分析调用失败：%w", cerr)
+	}
+	if c == nil {
+		return nil, ErrNotConfigured
+	}
+	conclusion := *c
+	usedModel := m
 
-	if c, m, cerr := callDeepSeek(ctx, ctxData, model); cerr != nil {
-		conclusion = fallback(scope, ctxData)
-		degraded, notice = true, "AI 服务调用失败，已使用本地启发式分析："+cerr.Error()
-	} else if c != nil {
-		conclusion, usedModel = *c, m
-	} else {
-		conclusion = fallback(scope, ctxData)
-		degraded, notice = true, "未配置 DeepSeek API Key，已使用本地启发式分析"
+	// Surface the current price from our own quote data (reliable, asset scope only)
+	// so the analysis output always shows a price even if the model omits it.
+	if scope == "asset" {
+		if q, ok := ctxData["quote"].(map[string]any); ok {
+			if pr, ok := q["price"].(float64); ok && pr > 0 {
+				conclusion.CurrentPrice = &pr
+			}
+		}
 	}
 
 	id := cryptox.UUID()
@@ -478,20 +346,13 @@ func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error)
 	createdAt := time.Now().UnixMilli()
 	_, _ = store.Exec(`INSERT INTO ai_analyses(id,scope,asset_id,model,status,prompt_tokens,completion_tokens,context_snapshot,conclusion,error_msg,duration_ms,created_at)
 	    VALUES(?,?,?,?,'ok',0,0,?,?,?,?,?)`,
-		id, scope, nullIf(assetID), usedModel, string(ctxJSON), string(concJSON), nullIf(notice), dur, createdAt)
+		id, scope, nullIf(assetID), usedModel, string(ctxJSON), string(concJSON), nil, dur, createdAt)
 
 	return &Result{
 		AnalysisID: id, Scope: scope, AssetID: assetID, Signal: conclusion.Signal,
 		Model: usedModel, Conclusion: conclusion, Context: ctxData,
-		DurationMs: dur, CreatedAt: createdAt, Degraded: degraded, Notice: notice,
+		DurationMs: dur, CreatedAt: createdAt, Degraded: false, Notice: "",
 	}, nil
-}
-
-func fallback(scope string, ctx map[string]any) Conclusion {
-	if scope == "asset" {
-		return heuristicAsset(ctx)
-	}
-	return heuristicGlobal(ctx)
 }
 
 func nullIf(s string) any {

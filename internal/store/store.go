@@ -187,7 +187,8 @@ CREATE INDEX IF NOT EXISTS idx_ai_asset ON ai_analyses(asset_id, created_at DESC
 CREATE TABLE IF NOT EXISTS fx_rates (
     currency   TEXT PRIMARY KEY,
     rate       REAL NOT NULL,        -- 1 单位该币种 = rate 个 CNY
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    auto       INTEGER NOT NULL DEFAULT 1  -- 1=由实时汇率刷新管理; 0=用户在设置页手动锁定
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -209,7 +210,8 @@ func Open() error {
 		return err
 	}
 	DataDir = filepath.Join(wd, "data")
-	if err := os.MkdirAll(DataDir, 0o755); err != nil {
+	// Restrict the data directory to the owner only (security audit F-10).
+	if err := os.MkdirAll(DataDir, 0o700); err != nil {
 		return err
 	}
 	DBPath = os.Getenv("INVESTHUB_DB")
@@ -229,6 +231,10 @@ func Open() error {
 	}
 	DB = db
 
+	// Narrow file permissions on the database files so other local accounts
+	// cannot read the (plaintext) investment data. Best-effort (security F-10).
+	tightenDBPerms()
+
 	if _, err := DB.Exec(DDL); err != nil {
 		return err
 	}
@@ -238,16 +244,41 @@ func Open() error {
 	return nil
 }
 
+// tightenDBPerms narrows permissions on the data directory and the SQLite
+// database files (main + -wal + -shm) to owner-only, because the database holds
+// plaintext investment data. master.key is already created 0600 by cryptox.
+func tightenDBPerms() {
+	_ = os.Chmod(DataDir, 0o700)
+	for _, p := range []string{DBPath, DBPath + "-wal", DBPath + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			_ = os.Chmod(p, 0o600)
+		}
+	}
+}
+
 // migrate applies lightweight schema migrations to databases created by older
 // builds (which predate the price_snapshots.status column).
 func migrate() {
-	if hasColumn("price_snapshots", "status") {
-		return
+	if !hasColumn("price_snapshots", "status") {
+		if _, err := DB.Exec(`ALTER TABLE price_snapshots ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'`); err != nil {
+			log.Printf("[store] migrate price_snapshots.status failed: %v", err)
+		} else {
+			log.Printf("[store] migrated price_snapshots: added status column")
+		}
 	}
-	if _, err := DB.Exec(`ALTER TABLE price_snapshots ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'`); err != nil {
-		log.Printf("[store] migrate price_snapshots.status failed: %v", err)
-	} else {
-		log.Printf("[store] migrated price_snapshots: added status column")
+	if !hasColumn("fx_rates", "auto") {
+		if _, err := DB.Exec(`ALTER TABLE fx_rates ADD COLUMN auto INTEGER NOT NULL DEFAULT 1`); err != nil {
+			log.Printf("[store] migrate fx_rates.auto failed: %v", err)
+		} else {
+			log.Printf("[store] migrated fx_rates: added auto column")
+		}
+	}
+	if !hasColumn("sessions", "ua") {
+		if _, err := DB.Exec(`ALTER TABLE sessions ADD COLUMN ua TEXT NOT NULL DEFAULT ''`); err != nil {
+			log.Printf("[store] migrate sessions.ua failed: %v", err)
+		} else {
+			log.Printf("[store] migrated sessions: added ua column")
+		}
 	}
 }
 

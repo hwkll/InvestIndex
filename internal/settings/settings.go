@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"investhub/internal/cryptox"
@@ -17,6 +18,7 @@ var encrypted = map[string]bool{
 	"deepseek_api_key": true,
 	"smtp_pass":        true,
 	"smtp_user":        true,
+	"webhook_url":      true, // P2: at-rest 加密 + List 掩码
 }
 
 // Get returns a setting value (decrypted when needed); "" when missing.
@@ -39,15 +41,22 @@ func GetDefault(key, def string) string {
 	return def
 }
 
-// Set upserts a value, encrypting sensitive keys.
-func Set(key, value string) {
+// Set upserts a value, encrypting sensitive keys. It returns an error when
+// encryption fails so the caller can abort instead of persisting plaintext
+// at rest (security audit F-16).
+func Set(key, value string) error {
 	stored := value
 	if encrypted[key] && value != "" {
-		stored = cryptox.Encrypt(value)
+		enc, err := cryptox.Encrypt(value)
+		if err != nil {
+			return fmt.Errorf("加密设置 %s 失败: %w", key, err)
+		}
+		stored = enc
 	}
-	_, _ = store.Exec(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+	_, err := store.Exec(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
 	    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, stored, time.Now().UnixMilli())
+	return err
 }
 
 // Delete removes a setting.
@@ -82,11 +91,17 @@ func List() map[string]any {
 		}
 	}
 	ensure("currency", "CNY")
-	ensure("deepseek_model", "deepseek-chat")
+	ensure("deepseek_model", "deepseek-v4-flash")
 	ensure("rate_usd_cny", "7.2")
 	ensure("data_source_mode", "auto")
+	// 刷新频率（秒）：行情轮询与多币种汇率刷新，均可在设置页调整并即时生效。
+	ensure("poll_interval", "30")
+	ensure("fx_refresh_interval", "1800")
 	if _, ok := out["deepseek_api_key"]; !ok {
 		out["deepseek_api_key"] = map[string]any{"has_value": false}
+	}
+	if _, ok := out["webhook_url"]; !ok {
+		out["webhook_url"] = map[string]any{"has_value": false}
 	}
 	return out
 }
@@ -97,7 +112,7 @@ func TestAI(apiKey, model string) map[string]any {
 		apiKey = Get("deepseek_api_key")
 	}
 	if model == "" {
-		model = GetDefault("deepseek_model", "deepseek-chat")
+		model = GetDefault("deepseek_model", "deepseek-v4-flash")
 	}
 	if apiKey == "" {
 		return map[string]any{"ok": false, "error": "未配置 API Key"}
@@ -121,4 +136,20 @@ func TestAI(apiKey, model string) map[string]any {
 		return map[string]any{"ok": false, "error": fmt.Sprintf("HTTP %d %s", resp.StatusCode, string(b))}
 	}
 	return map[string]any{"ok": true, "model": model}
+}
+
+// Migrate re-encrypts any plaintext rows for encrypted keys so that secrets at
+// rest are always ciphertext. Safe to call on every startup (idempotent).
+func Migrate() {
+	for k := range encrypted {
+		v, ok := store.ScalarStr(`SELECT value FROM settings WHERE key = ?`, k)
+		if !ok || v == "" {
+			continue
+		}
+		if !strings.HasPrefix(v, "enc:") {
+			if err := Set(k, v); err != nil { // Set encrypts when the key is in the encrypted set
+				fmt.Printf("[settings] 启动重加密 %s 失败: %v\n", k, err)
+			}
+		}
+	}
 }

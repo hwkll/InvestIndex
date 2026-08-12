@@ -4,7 +4,10 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,7 +38,7 @@ type backupFile struct {
 	Tables     map[string][]map[string]any `json:"tables"`
 }
 
-func dumpTable(name string) []map[string]any {
+func dumpTable(name string, redact bool) []map[string]any {
 	out := []map[string]any{}
 	rows, err := store.Query(`SELECT * FROM ` + name)
 	if err != nil {
@@ -63,21 +66,40 @@ func dumpTable(name string) []map[string]any {
 				rec[c] = vals[i]
 			}
 		}
+		// When redacting (user-facing export) never include secrets that enable
+		// offline brute-force or credential theft — the PIN hash and any *_hash /
+		// *_secret settings (security audit F-05).
+		if redact && name == "settings" {
+			if k, _ := rec["key"].(string); isExportProtectedSetting(k) {
+				continue
+			}
+		}
 		out = append(out, rec)
 	}
 	return out
 }
 
-func exportBackup() backupFile {
+// isExportProtectedSetting lists settings keys that must never leave the machine
+// in a user-facing backup. access_pin_hash is the scrypt PIN hash (offline
+// brute-force risk); any *_hash / *_secret keys are credentials.
+func isExportProtectedSetting(key string) bool {
+	if key == "access_pin_hash" {
+		return true
+	}
+	return strings.HasSuffix(key, "_hash") || strings.HasSuffix(key, "_secret")
+}
+
+func exportBackup(redact bool) backupFile {
 	b := backupFile{Version: Version, ExportedAt: time.Now().UnixMilli(), Tables: map[string][]map[string]any{}}
 	for _, t := range exportTables {
-		b.Tables[t] = dumpTable(t)
+		b.Tables[t] = dumpTable(t, redact)
 	}
 	return b
 }
 
 func handleExportJSON(w http.ResponseWriter, r *http.Request) {
-	body, err := json.MarshalIndent(exportBackup(), "", "  ")
+	// User-facing export redacts secret settings (PIN hash, *_hash/_secret).
+	body, err := json.MarshalIndent(exportBackup(true), "", "  ")
 	if err != nil {
 		fail(w, 50001, err.Error())
 		return
@@ -85,6 +107,29 @@ func handleExportJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="investhub-backup.json"`)
 	_, _ = w.Write(body)
+}
+
+// protectedSettingsKeys are never touched by an import. Importing a settings
+// table must never downgrade auth (clear the PIN hash) or clobber the live
+// credential, so these rows are skipped on insert and preserved on delete.
+func isProtectedSetting(key string) bool {
+	return key == "access_pin_hash"
+}
+
+// writePreImportBackup snapshots the current database to a timestamped JSON file
+// so a destructive import can be rolled back. Best-effort: a failure is logged
+// but does not abort the import.
+func writePreImportBackup() (string, error) {
+	ts := time.Now().Format("20060102-150405")
+	path := filepath.Join(store.DataDir, "investhub.db.bak-"+ts+".json")
+	body, err := json.MarshalIndent(exportBackup(false), "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func handleImportJSON(r *http.Request) (any, error) {
@@ -95,6 +140,14 @@ func handleImportJSON(r *http.Request) (any, error) {
 	if len(b.Tables) == 0 {
 		return nil, errf(40001, "无效的备份文件")
 	}
+
+	// Take an automatic rollback snapshot before mutating anything.
+	if bakPath, err := writePreImportBackup(); err == nil {
+		log.Printf("[backup] 导入前自动备份已保存: %s", bakPath)
+	} else {
+		log.Printf("[backup] 导入前自动备份失败（仍继续导入）: %v", err)
+	}
+
 	tx, err := store.DB.Begin()
 	if err != nil {
 		return nil, errf(50001, err.Error())
@@ -107,10 +160,28 @@ func handleImportJSON(r *http.Request) (any, error) {
 		if !has {
 			continue
 		}
-		if _, err := tx.Exec(`DELETE FROM ` + t); err != nil {
-			return nil, errf(50001, t+": "+err.Error())
+		if len(rowsIn) == 0 {
+			// An explicitly empty table in the backup means "leave as-is".
+			// Never wipe existing data, which previously let a malicious or
+			// accidental `{"settings":[]}` silently clear the PIN and config.
+			continue
+		}
+		if t == "settings" {
+			// Preserve the live PIN hash; only non-protected settings are wiped.
+			if _, err := tx.Exec(`DELETE FROM settings WHERE key != 'access_pin_hash'`); err != nil {
+				return nil, errf(50001, t+": "+err.Error())
+			}
+		} else {
+			if _, err := tx.Exec(`DELETE FROM ` + t); err != nil {
+				return nil, errf(50001, t+": "+err.Error())
+			}
 		}
 		for _, row := range rowsIn {
+			if t == "settings" {
+				if k, _ := row["key"].(string); isProtectedSetting(k) {
+					continue // never import a PIN hash
+				}
+			}
 			cols := make([]string, 0, len(row))
 			args := make([]any, 0, len(row))
 			for k, v := range row {

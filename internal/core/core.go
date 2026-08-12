@@ -375,13 +375,21 @@ type PositionView struct {
 	AccumulatedPnl float64  `json:"accumulatedPnl"`
 	DaysHeld       int      `json:"daysHeld"`
 	QuoteStatus    string   `json:"quoteStatus"`
+	SubType        string   `json:"subType"`
+	// 跨币种视图：把市值/成本/浮盈折成本位币（CNY），便于与人民币资产统一对比。
+	// 非 CNY 资产才填充 FxRate/FxNote；CNY 资产二者为 0 / 空。
+	MarketValueCny float64 `json:"marketValueCny"`
+	CostTotalCny   float64 `json:"costTotalCny"`
+	FloatingPnlCny float64 `json:"floatingPnlCny"`
+	FxRate         float64 `json:"fxRate"`
+	FxNote         string  `json:"fxNote"`
 }
 
 // GetPositionView builds the derived view for one asset.
 func GetPositionView(assetID string) *PositionView {
-	var cat, name, symbol, currency string
-	err := store.QueryRow(`SELECT category, name, symbol, currency FROM assets WHERE id = ?`, assetID).
-		Scan(&cat, &name, &symbol, &currency)
+	var cat, name, symbol, currency, subType string
+	err := store.QueryRow(`SELECT category, name, symbol, currency, COALESCE(sub_type,'') FROM assets WHERE id = ?`, assetID).
+		Scan(&cat, &name, &symbol, &currency, &subType)
 	if err != nil {
 		return nil
 	}
@@ -402,12 +410,28 @@ func GetPositionView(assetID string) *PositionView {
 	if p.FirstBuy > 0 {
 		days = int((nowMs() - p.FirstBuy) / 86400000)
 	}
+	// 跨币种折算：以资产本币计算市值/成本/浮盈，再经 Convert 折本位币 CNY。
+	// FxRate/FxNote 仅对非 CNY 资产有意义，用于前端 tooltip 说明换算口径。
+	acct := currency
+	if acct == "" {
+		acct = "CNY"
+	}
+	fx := fxRateToCNY(acct)
+	mvCny := Convert(mv, acct, "CNY")
+	costCny := Convert(p.CostTotal, acct, "CNY")
+	flCny := Convert(fl, acct, "CNY")
+	fxNote := ""
+	if acct != "CNY" && fx > 0 {
+		fxNote = fmt.Sprintf("%s × %.2f → CNY", acct, fx)
+	}
 	return &PositionView{
 		AssetID: assetID, Category: cat, Name: name, Symbol: symbol, Currency: currency,
 		Qty: p.Qty, AvgCost: p.AvgCost, CostTotal: p.CostTotal,
 		Price: price, ChgPct: chg, MarketValue: mv,
 		FloatingPnl: fl, FloatingPct: flPct, RealizedPnl: p.RealizedPnl,
-		AccumulatedPnl: fl + p.RealizedPnl, DaysHeld: days, QuoteStatus: status,
+		AccumulatedPnl: fl + p.RealizedPnl, DaysHeld: days, QuoteStatus: status, SubType: subType,
+		MarketValueCny: mvCny, CostTotalCny: costCny, FloatingPnlCny: flCny,
+		FxRate: fx, FxNote: fxNote,
 	}
 }
 

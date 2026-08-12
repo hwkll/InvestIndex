@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue';
 import { Api } from '../api';
 import { useApp } from '../store';
 import ModalDialog from '../components/ModalDialog.vue';
-import { date, SIGNAL_LABEL, signalClass } from '../format';
+import { date, price, SIGNAL_LABEL, signalClass } from '../format';
 
 const app = useApp();
 
@@ -16,6 +16,8 @@ const detail = ref(null);
 const detailLoading = ref(false);
 const target = ref('');
 const confirmDel = ref(null);
+const keyConfigured = ref(true);
+const needConfig = ref(false);
 
 async function load() {
   try {
@@ -27,12 +29,23 @@ async function load() {
 
 onMounted(async () => {
   try { assets.value = await Api.assets(); } catch { /* ignore */ }
+  try {
+    const s = await Api.settings();
+    keyConfigured.value = !!(s.deepseek_api_key && s.deepseek_api_key.has_value);
+  } catch { /* ignore */ }
   await load();
 });
 
 const pages = computed(() => Math.max(1, Math.ceil((list.value.total || 0) / 20)));
 
 async function run(kind) {
+  if (!keyConfigured.value) { needConfig.value = true; return; }
+  if (!localStorage.getItem('ih_ai_egress_ack')) {
+    if (!confirm('数据出境提示：AI 分析会将相关持仓与行情数据发送至 DeepSeek 境外服务器处理。确认你已了解并同意该跨境数据传输？')) {
+      return;
+    }
+    localStorage.setItem('ih_ai_egress_ack', '1');
+  }
   running.value = true;
   try {
     const body = kind === 'global' ? { scope: 'global' } : { scope: 'asset', assetId: target.value };
@@ -42,6 +55,11 @@ async function run(kind) {
     await load();
     detail.value = { ...r, id: r.analysisId };
   } catch (e) {
+    if (e.code === 40301) {
+      needConfig.value = true;
+      app.toast('需要配置', '请先在「设置 → AI 分析」配置 DeepSeek API Key', 'alert');
+      return;
+    }
     app.toast('分析失败', e.message, 'error');
   } finally {
     running.value = false;
@@ -81,8 +99,16 @@ const conclusion = computed(() => detail.value?.conclusion || null);
     <div class="page-head">
       <div>
         <div class="page-title">AI 分析</div>
-        <div class="page-sub">基于持仓、行情与技术指标生成结构化结论；未配置 DeepSeek Key 时自动降级为本地启发式分析</div>
+        <div class="page-sub">基于持仓、行情与技术指标，由 DeepSeek V4 生成结构化结论（需配置 API Key）</div>
       </div>
+    </div>
+
+    <div v-if="needConfig || !keyConfigured" class="card card-pad flex between center" style="border-left: 3px solid #e0a000; background: rgba(224,160,0,.08)">
+      <div>
+        <b>尚未配置 DeepSeek API Key</b>
+        <p class="muted" style="margin: 4px 0 0">AI 分析需要先配置 DeepSeek API Key（V4 系列模型），配置后将自动启用。</p>
+      </div>
+      <router-link to="/settings" class="btn sm">去设置</router-link>
     </div>
 
     <div class="card card-pad">
@@ -91,10 +117,10 @@ const conclusion = computed(() => detail.value?.conclusion || null);
           <option value="">选择要分析的标的…</option>
           <option v-for="a in assets" :key="a.id" :value="a.id">{{ a.name }}（{{ a.symbol }}）</option>
         </select>
-        <button class="btn sm" :disabled="running" @click="run('asset')">
+        <button class="btn sm" :disabled="running || !keyConfigured" @click="run('asset')">
           <span v-if="running" class="spin"></span>分析该标的
         </button>
-        <button class="btn sm sec" :disabled="running" @click="run('global')">分析整体组合</button>
+        <button class="btn sm sec" :disabled="running || !keyConfigured" @click="run('global')">分析整体组合</button>
         <span class="muted">结论仅供参考，不构成投资建议</span>
       </div>
     </div>
@@ -146,6 +172,16 @@ const conclusion = computed(() => detail.value?.conclusion || null);
           <div class="muted">置信度 {{ ((conclusion.confidence || 0) * 100).toFixed(0) }}% · {{ detail.model }}</div>
         </div>
         <div class="bar mt8"><i :style="{ width: ((conclusion.confidence || 0) * 100) + '%' }"></i></div>
+        <div class="flex mt12" style="gap:18px" v-if="conclusion.currentPrice || conclusion.targetPrice">
+          <div v-if="conclusion.currentPrice" style="display:flex;flex-direction:column;gap:2px">
+            <span class="muted" style="font-size:12px">当前价</span>
+            <b class="num">{{ price(conclusion.currentPrice) }}</b>
+          </div>
+          <div v-if="conclusion.targetPrice" style="display:flex;flex-direction:column;gap:2px">
+            <span class="muted" style="font-size:12px">目标价</span>
+            <b class="num up">{{ price(conclusion.targetPrice) }}</b>
+          </div>
+        </div>
         <p class="mt12" style="line-height: 1.7">{{ conclusion.summary }}</p>
         <template v-if="conclusion.reasons?.length">
           <div class="muted mt8">主要理由</div>

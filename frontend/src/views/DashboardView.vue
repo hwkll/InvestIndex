@@ -16,6 +16,7 @@ const range = ref('30d');
 const loading = ref(true);
 const posCache = ref({});   // category -> { items, subtotal }  (cached positions for live merge)
 const fx = ref({ CNY: 1 }); // currency -> CNY per unit
+const fxList = ref([]);       // raw fx rows (currency, rate, auto, updatedAt)
 const benchmark = ref('');  // current benchmark symbol (mirrors settings)
 let liveTick = ref(0);      // bumped on every SSE quote frame
 let reloadTimer = null;
@@ -27,6 +28,19 @@ const mainRate = computed(() => fx.value[cur.value] || 1);
 // client-side FX so the live category table can merge SSE prices without a server round-trip
 function conv(amount, from) {
   return amount * (fx.value[from] || 1) / mainRate.value;
+}
+
+// Latest live FX refresh time (max updated_at among auto-managed rates), shown
+// as a small footnote so the user can see cross-currency values are current.
+const fxUpdatedAt = computed(() => {
+  const ts = (fxList.value || []).filter((r) => r.auto).map((r) => r.updatedAt || 0);
+  return ts.length ? Math.max(...ts) : 0;
+});
+function fmtFxTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 async function loadSummary() {
@@ -50,7 +64,11 @@ async function loadPositions() {
 }
 
 async function loadFx() {
-  try { fx.value = await Api.fxRates().then((r) => Object.fromEntries(r.map((x) => [x.currency, x.rate]))); }
+  try {
+    const list = await Api.fxRates();
+    fx.value = Object.fromEntries(list.map((x) => [x.currency, x.rate]));
+    fxList.value = list;
+  }
   catch { /* ignore */ }
 }
 
@@ -220,6 +238,8 @@ const trendOption = computed(() => {
         <StatCard label="今日盈亏" :value="signed(summary?.dayPnl, cur)" :delta="`已实现 ${signed(summary?.totalRealizedPnl || 0, cur)}`" :deltaClass="dirClass(summary?.dayPnl)" :loading="false" />
       </div>
 
+      <div v-if="fxUpdatedAt" class="fx-note muted mini">汇率更新于 {{ fmtFxTime(fxUpdatedAt) }}</div>
+
       <div class="grid cards-3 section">
         <div class="card chart-wrap">
           <div class="section-title">资产分布</div>
@@ -302,6 +322,7 @@ const trendOption = computed(() => {
   margin-bottom: 16px; background: #fff7ed; color: #9a4a00; border: 1px solid #ffd8a8;
 }
 .quote-banner .qb-ico { font-size: 14px; margin-top: 1px; }
+.fx-note { margin: 2px 0 14px; }
 .excess { margin-top: 8px; font-size: 13px; font-weight: 600; }
 .mini-sel { font-size: 12px; padding: 3px 6px; border-radius: 7px; border: 1px solid var(--line); background: #fff; color: var(--ink); }
 </style>

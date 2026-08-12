@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -187,7 +188,10 @@ func handleAnalyze(r *http.Request) (any, error) {
 	}
 	res, err := ai.Analyze(r.Context(), pick(body.Scope, "asset"), body.AssetID, body.Model)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, ai.ErrNotConfigured) {
+			return nil, errf(40301, "请在「设置 → AI 分析」中配置 DeepSeek API Key 后再使用 AI 分析")
+		}
+		return nil, errf(500, err.Error())
 	}
 	Broadcast("ai_done", map[string]any{
 		"analysisId": res.AnalysisID, "scope": res.Scope, "assetId": res.AssetID,
@@ -250,7 +254,7 @@ func handleListEvents(r *http.Request) (any, error) {
 
 // ---------------- settings ----------------
 
-func handleUpdateSettings(r *http.Request) (any, error) {
+func (s *Server) handleUpdateSettings(r *http.Request) (any, error) {
 	var body map[string]any
 	if err := decode(r, &body); err != nil {
 		return nil, err
@@ -262,6 +266,7 @@ func handleUpdateSettings(r *http.Request) (any, error) {
 		"smtp_user": true, "smtp_pass": true, "smtp_from": true,
 		"smtp_tls": true, "smtp_to": true, "webhook_url": true,
 		"benchmark": true, "deepseek_api_key": true,
+		"poll_interval": true, "fx_refresh_interval": true,
 	}
 	updates := map[string]bool{}
 	for k, v := range body {
@@ -271,10 +276,46 @@ func handleUpdateSettings(r *http.Request) (any, error) {
 		if !allowedKeys[k] {
 			continue // silently skip unknown keys
 		}
-		settings.Set(k, toStr(v))
+		storeVal := toStr(v)
+		// Clamp refresh intervals so the persisted value always matches the
+		// effective timer used by the scheduler.
+		if k == "poll_interval" || k == "fx_refresh_interval" {
+			if n, err := strconv.Atoi(storeVal); err != nil || n <= 0 {
+				if k == "poll_interval" {
+					storeVal = "30"
+				} else {
+					storeVal = "1800"
+				}
+			} else if k == "poll_interval" {
+				if n < 5 {
+					n = 5
+				}
+				if n > 600 {
+					n = 600
+				}
+				storeVal = strconv.Itoa(n)
+			} else {
+				if n < 60 {
+					n = 60
+				}
+				if n > 86400 {
+					n = 86400
+				}
+				storeVal = strconv.Itoa(n)
+			}
+		}
+		if err := settings.Set(k, storeVal); err != nil {
+			return nil, err
+		}
 		updates[k] = true
-		if k == "data_source_mode" {
-			quotes.SetMode(toStr(v))
+		// Hot-reload effects: a few keys change runtime behavior immediately.
+		switch k {
+		case "data_source_mode":
+			quotes.SetMode(storeVal)
+		case "poll_interval":
+			s.TriggerPollReset()
+		case "fx_refresh_interval":
+			s.TriggerFxReset()
 		}
 	}
 	return map[string]any{"updates": updates}, nil

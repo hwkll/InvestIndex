@@ -2,7 +2,6 @@ package api
 
 import (
 	"log"
-	"os"
 	"strconv"
 	"time"
 
@@ -66,35 +65,111 @@ func (s *Server) StartScheduler() {
 	core.SeedHistoricalSnapshots(90)
 	core.TakeSnapshots()
 
-	pollSec := 30
-	if v := os.Getenv("POLL_INTERVAL"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if n > 600 {
-				n = 600 // cap at 10 minutes so daily snapshots aren't missed
+	// Refresh FX rates once at startup (best-effort), then on a low-frequency
+	// ticker so cross-currency market values track live CNY conversion. The
+	// interval is configurable (fx_refresh_interval, seconds) and hot-reloaded
+	// via the fxReset channel when the setting changes.
+	quotes.RefreshFX()
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[scheduler] fx goroutine panic: %v", rec)
 			}
-			pollSec = n
+		}()
+		t := time.NewTicker(currentFxInterval())
+		defer t.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-s.fxReset:
+				d := currentFxInterval()
+				t.Reset(d)
+				log.Printf("[scheduler] fx refresh interval -> %s", d)
+			case <-t.C:
+				quotes.RefreshFX()
+			}
 		}
-	}
-	interval := time.Duration(pollSec) * time.Second
+	}()
 
+	// Quote polling cadence (poll_interval, seconds). Configurable and hot-reloaded
+	// via the pollReset channel — no restart needed.
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("[scheduler] goroutine panic: %v", rec)
 			}
 		}()
-		t := time.NewTicker(interval)
+		t := time.NewTicker(currentPollInterval())
 		defer t.Stop()
 		for {
 			select {
 			case <-s.stop:
 				return
+			case <-s.pollReset:
+				d := currentPollInterval()
+				t.Reset(d)
+				log.Printf("[scheduler] quote poll interval -> %ds", int(d.Seconds()))
 			case <-t.C:
 				s.tick()
 			}
 		}
 	}()
-	log.Printf("[scheduler] quote poll every %ds", pollSec)
+	log.Printf("[scheduler] quote poll every %ds, fx refresh every %s", int(currentPollInterval().Seconds()), currentFxInterval())
+}
+
+// currentPollInterval reads the quote polling cadence (seconds) from settings,
+// clamped to a sane range so the server can't be told to spin or to stall.
+func currentPollInterval() time.Duration {
+	sec := 30
+	if v := settings.GetDefault("poll_interval", "30"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n < 5 {
+				n = 5
+			}
+			if n > 600 {
+				n = 600 // cap at 10 minutes so daily snapshots aren't missed
+			}
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// currentFxInterval reads the FX refresh cadence (seconds) from settings,
+// clamped so the remote FX source is neither hammered nor starved.
+func currentFxInterval() time.Duration {
+	sec := 1800
+	if v := settings.GetDefault("fx_refresh_interval", "1800"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n < 60 {
+				n = 60
+			}
+			if n > 86400 {
+				n = 86400 // at most once a day
+			}
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// TriggerPollReset asks the scheduler to reload the quote-poll interval.
+// Non-blocking: at most one pending signal is queued; the goroutine reads the
+// latest configured value when it wakes, so a dropped signal is harmless.
+func (s *Server) TriggerPollReset() {
+	select {
+	case s.pollReset <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerFxReset asks the scheduler to reload the FX-refresh interval.
+func (s *Server) TriggerFxReset() {
+	select {
+	case s.fxReset <- struct{}{}:
+	default:
+	}
 }
 
 // Stop halts the scheduler goroutine. Safe to call multiple times.
@@ -129,7 +204,9 @@ func (s *Server) tick() {
 		today := now.Format("2006-01-02")
 		if settings.Get("_last_snapshot") != today {
 			core.TakeSnapshots()
-			settings.Set("_last_snapshot", today)
+			if err := settings.Set("_last_snapshot", today); err != nil {
+				log.Printf("[scheduler] 记录 _last_snapshot 失败: %v", err)
+			}
 		}
 	}
 

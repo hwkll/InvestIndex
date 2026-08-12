@@ -8,11 +8,16 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -474,8 +479,9 @@ func UnreadCount() int64 {
 }
 
 // sendMailReal delivers body to the recipient via the configured SMTP server.
-// It supports implicit TLS (port 465), STARTTLS (587/25) and plaintext, and
-// authenticates with SMTP PLAIN when credentials are present.
+// It supports implicit TLS (port 465) and STARTTLS (587/25); a plaintext-only
+// server (no STARTTLS) is rejected for safety (F-14). It authenticates with
+// SMTP PLAIN when credentials are present.
 func sendMailReal(to, subject, body string) error {
 	host := settings.Get("smtp_host")
 	if host == "" {
@@ -494,24 +500,29 @@ func sendMailReal(to, subject, body string) error {
 	var c *smtp.Client
 	var err error
 	if implicit {
-		conn, e := tls.Dial("tcp", addr, &tls.Config{ServerName: host})
+		conn, e := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
 		if e != nil {
-			return e
+			return fmt.Errorf("隐式 TLS 连接失败: %w", e)
 		}
 		c, err = smtp.NewClient(conn, host)
 	} else {
 		c, err = smtp.Dial(addr)
+		if err != nil {
+			return err
+		}
+		// F-14: 拒绝明文发送——服务器必须支持 STARTTLS，否则报错。
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("SMTP 服务器不支持 STARTTLS，出于安全拒绝明文发送")
+		}
+		if e := c.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); e != nil {
+			return fmt.Errorf("STARTTLS 升级失败: %w", e)
+		}
 	}
 	if err != nil {
 		return err
 	}
 	defer c.Quit()
 
-	if ok, _ := c.Extension("STARTTLS"); ok && !implicit {
-		if e := c.StartTLS(&tls.Config{ServerName: host}); e != nil {
-			return e
-		}
-	}
 	if user != "" {
 		if e := c.Auth(smtp.PlainAuth("", user, pass, host)); e != nil {
 			return e
@@ -533,11 +544,101 @@ func sendMailReal(to, subject, body string) error {
 	return w.Close()
 }
 
-// fireWebhook POSTs the alert message as JSON to the configured webhook URL.
+// ---- Webhook 安全错误（仅 errWebhookGeneric 会回显给客户端）----
+var (
+	errWebhookNoURL      = errors.New("webhook 未配置")
+	errWebhookBadURL     = errors.New("webhook 地址格式非法")
+	errWebhookProto      = errors.New("webhook 仅支持 https")
+	errWebhookResolve    = errors.New("webhook 域名解析失败")
+	errWebhookRestricted = errors.New("webhook 目标地址被安全策略禁止")
+	errWebhookRedirect   = errors.New("webhook 重定向被禁止")
+	errWebhookGeneric    = errors.New("webhook 发送失败") // 客户端仅见此泛化错误
+)
+
+// allowWebhookHTTP：默认 false（仅 https）；设 INVESTHUB_WEBHOOK_ALLOW_HTTP=1 放开 http（IP 校验不变）。
+var allowWebhookHTTP = os.Getenv("INVESTHUB_WEBHOOK_ALLOW_HTTP") == "1"
+
+// isRestricted 判断 IP 是否落入禁止范围（回环/私网/链路本地/未指定）。
+func isRestricted(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if v := ip.To4(); v != nil { // 归一化 IPv4-mapped IPv6
+		ip = v
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
+type ssrfPinKey struct{}
+
+func withPinnedIPs(ctx context.Context, ips []net.IP) context.Context {
+	return context.WithValue(ctx, ssrfPinKey{}, ips)
+}
+
+// ssrfDial 直接连接已校验 IP，防 DNS rebinding 绕过。
+func ssrfDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, port = addr, "443"
+	}
+	if pinned, ok := ctx.Value(ssrfPinKey{}).([]net.IP); ok && len(pinned) > 0 {
+		d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 0}
+		return d.DialContext(ctx, network, net.JoinHostPort(pinned[0].String(), port))
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, errWebhookResolve
+	}
+	for _, ip := range ips {
+		if isRestricted(ip) {
+			return nil, errWebhookRestricted
+		}
+	}
+	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 0}
+	return d.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+}
+
+// webhookClient 单一复用实例：禁止重定向 + 自定义 Dial（IP 校验 + 防 rebinding）。
+var webhookClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		DialContext:       ssrfDial,
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
+		Proxy:             nil, // 禁用代理：避免代理成为 SSRF 跳板绕过 IP 校验
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return errWebhookRedirect // 一律禁止跳转
+	},
+}
+
+// fireWebhook POSTs the alert message as JSON to the configured webhook URL,
+// with SSRF protection: https-only (unless http is explicitly allowed),
+// resolved IPs must not be loopback/private/link-local, redirects are
+// forbidden, and the dial pins to a pre-validated IP to defeat DNS rebinding.
 func fireWebhook(message string) error {
-	url := settings.Get("webhook_url")
-	if url == "" {
-		return fmt.Errorf("未配置 webhook 地址（webhook_url）")
+	raw := settings.Get("webhook_url")
+	if raw == "" {
+		return errWebhookNoURL
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return errWebhookBadURL
+	}
+	if u.Scheme != "https" {
+		if !allowWebhookHTTP || u.Scheme != "http" {
+			return errWebhookProto
+		}
+	}
+	ips, err := net.LookupIP(u.Hostname())
+	if err != nil || len(ips) == 0 {
+		return errWebhookResolve
+	}
+	for _, ip := range ips {
+		if isRestricted(ip) {
+			log.Printf("[webhook] 目标 IP 被禁止: %v", ip) // 仅服务端日志
+			return errWebhookRestricted
+		}
 	}
 	payload, err := json.Marshal(map[string]any{
 		"source":  "InvestHub",
@@ -545,32 +646,36 @@ func fireWebhook(message string) error {
 		"time":    time.Now().UnixMilli(),
 	})
 	if err != nil {
-		return err
+		return errWebhookGeneric
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	ctx = withPinnedIPs(ctx, ips) // Dial 时直连已校验 IP，防 DNS rebinding
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return errWebhookGeneric
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := webhookClient.Do(req)
 	if err != nil {
-		return err
+		log.Printf("[webhook] 发送失败: %v", err) // 结构化日志仅服务端
+		return errWebhookGeneric
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook 返回 HTTP %d", resp.StatusCode)
+		log.Printf("[webhook] 端点返回 HTTP %d", resp.StatusCode) // 仅服务端日志
+		return errWebhookGeneric
 	}
 	return nil
 }
 
-var webhookClient = &http.Client{Timeout: 10 * time.Second}
-
 // TestWebhook sends a sample message to verify the configured webhook_url.
 func TestWebhook() map[string]any {
-	if err := fireWebhook("InvestHub 测试消息：如果你的 Webhook 接收端收到这条消息，说明配置成功。"); err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
+	const msg = "InvestHub 测试消息：如果你的 Webhook 接收端收到这条消息，说明配置成功。"
+	if err := fireWebhook(msg); err != nil {
+		log.Printf("[webhook][test] 测试发送失败: %v", err)
+		return map[string]any{"ok": false, "error": "Webhook 测试发送失败，请检查地址配置"}
 	}
 	return map[string]any{"ok": true}
 }
