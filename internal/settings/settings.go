@@ -97,6 +97,9 @@ func List() map[string]any {
 	// 刷新频率（秒）：行情轮询与多币种汇率刷新，均可在设置页调整并即时生效。
 	ensure("poll_interval", "30")
 	ensure("fx_refresh_interval", "1800")
+	// AI 市场环境增强：服务端预抓取真实大盘指数 / 行业板块 / 宏观作为分析背景。
+	ensure("ai_market_context", "true")
+	ensure("ai_market_context_ttl", "900")
 	if _, ok := out["deepseek_api_key"]; !ok {
 		out["deepseek_api_key"] = map[string]any{"has_value": false}
 	}

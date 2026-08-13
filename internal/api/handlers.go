@@ -267,6 +267,7 @@ func (s *Server) handleUpdateSettings(r *http.Request) (any, error) {
 		"smtp_tls": true, "smtp_to": true, "webhook_url": true,
 		"benchmark": true, "deepseek_api_key": true,
 		"poll_interval": true, "fx_refresh_interval": true,
+		"ai_market_context": true, "ai_market_context_ttl": true,
 	}
 	updates := map[string]bool{}
 	for k, v := range body {
@@ -316,6 +317,11 @@ func (s *Server) handleUpdateSettings(r *http.Request) (any, error) {
 			s.TriggerPollReset()
 		case "fx_refresh_interval":
 			s.TriggerFxReset()
+		case "ai_market_context":
+			// Toggling the feature on/off: warm (or clear) the cache immediately.
+			ai.RefreshMarketContext()
+		case "ai_market_context_ttl":
+			s.TriggerMarketCtxReset()
 		}
 	}
 	return map[string]any{"updates": updates}, nil

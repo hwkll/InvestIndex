@@ -143,21 +143,21 @@ type Result struct {
 	Notice     string     `json:"notice,omitempty"`
 }
 
-func buildAssetContext(assetID string) (map[string]any, error) {
+func buildAssetContext(assetID string) (map[string]any, map[string]string, error) {
 	a := core.GetAsset(assetID)
 	if a == nil {
-		return nil, fmt.Errorf("标的不存在")
+		return nil, nil, fmt.Errorf("标的不存在")
 	}
 	v := core.GetPositionView(assetID)
 	if v == nil {
-		return nil, fmt.Errorf("标的不存在")
+		return nil, nil, fmt.Errorf("标的不存在")
 	}
 	kl := quotes.Kline(assetID, "1d", 30)
 	closes := make([]float64, 0, len(kl))
 	for _, c := range kl {
 		closes = append(closes, math.Round(c.Close*10000)/10000)
 	}
-	return map[string]any{
+	ctxData := map[string]any{
 		"asset": map[string]any{"name": a.Name, "symbol": a.Symbol, "category": a.Category, "currency": a.Currency},
 		"position": map[string]any{
 			"qty": v.Qty, "avgCost": v.AvgCost, "costTotal": v.CostTotal, "price": v.Price,
@@ -168,10 +168,17 @@ func buildAssetContext(assetID string) (map[string]any, error) {
 		"quote":        map[string]any{"price": v.Price, "chgPct": v.ChgPct},
 		"indicators":   Compute(assetID, a.Category),
 		"recentCloses": closes,
-	}, nil
+	}
+	// Merge server-side market context (indices / boards / macro) as background
+	// context. This is pure data prep BEFORE the DeepSeek call; a failure leaves
+	// mc == nil and is swallowed here (never an error).
+	if mc, _ := FetchMarketContext("asset", *a); mc != nil {
+		ctxData["marketContext"] = mc
+	}
+	return ctxData, nil, nil
 }
 
-func buildGlobalContext() map[string]any {
+func buildGlobalContext() (map[string]any, map[string]string) {
 	s := core.GlobalSummary()
 	cats := map[string]any{}
 	for _, c := range core.Categories {
@@ -181,11 +188,16 @@ func buildGlobalContext() map[string]any {
 			"realizedPnl": cat.RealizedPnl, "floatingPct": cat.FloatingPct, "count": cat.Count,
 		}
 	}
-	return map[string]any{
+	ctxData := map[string]any{
 		"asOf": time.Now().Format(time.RFC3339), "mainCurrency": s.MainCurrency,
 		"totalAssets": s.TotalAssets, "cashTotal": s.CashTotal, "totalPnl": s.TotalPnl,
 		"totalReturn": s.TotalReturn, "dayPnl": s.DayPnl, "categories": cats,
 	}
+	mc, status := FetchMarketContext("global", core.Asset{})
+	if mc != nil {
+		ctxData["marketContext"] = mc
+	}
+	return ctxData, status
 }
 
 // ---- DeepSeek -----------------------------------------------------------
@@ -201,7 +213,8 @@ const sysPrompt = `你是一名严谨、专业的投资分析师，服务于个�
 	`4. signal 必须从给定枚举中选取；confidence 为 0~1 之间的置信度，数值越高代表判断越明确。` +
 	`5. 风险提示中必须包含：本结论由 AI 模型生成，不构成任何投资建议。` +
 	`6. 若上下文数据不足（如无可交易持仓、缺少技术指标），请如实说明，不要强行给出买卖信号，可将 signal 设为 "hold" 并在 reasons 中解释原因。` +
-	`7. 上下文已提供该标的的当前价（quote.price）。当 signal 为 "buy" 时，必须在 JSON 中给出 targetPrice（建议的目标/预期买入价位，单位与 quote.price 一致，须为大于 0 的数值，并明显区别于当前价）；若 signal 不是 "buy"，targetPrice 可省略或置为 null。`
+	`7. 上下文已提供该标的的当前价（quote.price）。当 signal 为 "buy" 时，必须在 JSON 中给出 targetPrice（建议的目标/预期买入价位，单位与 quote.price 一致，须为大于 0 的数值，并明显区别于当前价）；若 signal 不是 "buy"，targetPrice 可省略或置为 null。` +
+	"8. 上下文中可能附带 `marketContext`（公开市场信息：大盘指数 / 行业板块 / 宏观）。如有，可作为背景补充参考，须基于其中的真实数据、并可引用数据来源时间；若某维度缺失，则不得假设其数值。"
 
 // deepseekClient is reused across calls to avoid TCP connection churn.
 var deepseekClient = &http.Client{Timeout: 60 * time.Second}
@@ -308,15 +321,16 @@ func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error)
 
 	start := time.Now()
 	var ctxData map[string]any
+	var mstatus map[string]string
 	var err error
 	if scope == "asset" {
-		ctxData, err = buildAssetContext(assetID)
+		ctxData, mstatus, err = buildAssetContext(assetID)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		scope = "global"
-		ctxData = buildGlobalContext()
+		ctxData, mstatus = buildGlobalContext()
 	}
 
 	c, m, cerr := callDeepSeek(ctx, ctxData, model)
@@ -339,6 +353,16 @@ func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error)
 		}
 	}
 
+	// Market-context degradation: a "nosource" dimension means that part of the
+	// public-market background could not be fetched. This is independent of the
+	// AI hard rules (no-key / call-fail) — we still ran DeepSeek above. Flag it
+	// so the UI can surface "市场环境部分不可用" without implying a local/fake run.
+	degraded, missing := summarizeMarketStatus(mstatus)
+	notice := ""
+	if degraded {
+		notice = "市场环境部分不可用（缺失：" + strings.Join(missing, "/") + "）"
+	}
+
 	id := cryptox.UUID()
 	ctxJSON, _ := json.Marshal(ctxData)
 	concJSON, _ := json.Marshal(conclusion)
@@ -351,7 +375,7 @@ func Analyze(ctx context.Context, scope, assetID, model string) (*Result, error)
 	return &Result{
 		AnalysisID: id, Scope: scope, AssetID: assetID, Signal: conclusion.Signal,
 		Model: usedModel, Conclusion: conclusion, Context: ctxData,
-		DurationMs: dur, CreatedAt: createdAt, Degraded: false, Notice: "",
+		DurationMs: dur, CreatedAt: createdAt, Degraded: degraded, Notice: notice,
 	}, nil
 }
 
@@ -360,6 +384,35 @@ func nullIf(s string) any {
 		return nil
 	}
 	return s
+}
+
+// summarizeMarketStatus turns the per-dimension source status into the
+// Degraded flag + a human-readable list of missing dimensions. A dimension is
+// "missing" only when it is fully "nosource"; "n/a" (not applicable, e.g.
+// boards for crypto/gold) does NOT count as a failure.
+func summarizeMarketStatus(status map[string]string) (bool, []string) {
+	if status == nil {
+		return false, nil
+	}
+	var missing []string
+	for _, dim := range []string{"indices", "boards", "macro"} {
+		if status[dim] == "nosource" {
+			missing = append(missing, dimLabel(dim))
+		}
+	}
+	return len(missing) > 0, missing
+}
+
+func dimLabel(d string) string {
+	switch d {
+	case "indices":
+		return "指数"
+	case "boards":
+		return "板块"
+	case "macro":
+		return "宏观"
+	}
+	return d
 }
 
 // ---- history ------------------------------------------------------------

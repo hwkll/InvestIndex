@@ -17,6 +17,7 @@ const DEFAULTS = {
   smtp_to: '',
   smtp_tls: '0',
   webhook_url: '',
+  ai_market_context: 'true',
   benchmark: '',
   poll_interval: '30',
   fx_refresh_interval: '1800',
@@ -556,6 +557,19 @@ async function doImport() {
           </div>
         </div>
       </header>
+
+      <div class="set-row">
+        <div class="rl">
+          <label>市场上下文增强</label>
+          <p>AI 分析时自动附带真实大盘指数 / 行业板块 / 宏观经济作为背景参考；数据缺失时自动降级，不影响分析结论</p>
+        </div>
+        <div class="rr">
+          <label class="switch">
+            <input type="checkbox" :checked="form.ai_market_context === 'true'" @change="form.ai_market_context = $event.target.checked ? 'true' : 'false'" />
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
 
       <div class="set-row">
         <div class="rl">

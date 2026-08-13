@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"investhub/internal/ai"
 	"investhub/internal/alerts"
 	"investhub/internal/core"
 	"investhub/internal/quotes"
@@ -115,7 +116,36 @@ func (s *Server) StartScheduler() {
 			}
 		}
 	}()
-	log.Printf("[scheduler] quote poll every %ds, fx refresh every %s", int(currentPollInterval().Seconds()), currentFxInterval())
+
+	// Market-context refresh (background warm-up of the AI analysis market
+	// context cache). Best-effort: a failed upstream fetch leaves the cache
+	// stale/empty and is logged, but never blocks startup. Interval is the
+	// ai_market_context_ttl setting, hot-reloaded via marketCtxReset.
+	ai.RefreshMarketContext()
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[scheduler] market-ctx goroutine panic: %v", rec)
+			}
+		}()
+		t := time.NewTicker(currentMarketCtxInterval())
+		defer t.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-s.marketCtxReset:
+				d := currentMarketCtxInterval()
+				t.Reset(d)
+				log.Printf("[scheduler] market-ctx refresh interval -> %s", d)
+				ai.RefreshMarketContext()
+			case <-t.C:
+				ai.RefreshMarketContext()
+			}
+		}
+	}()
+	log.Printf("[scheduler] quote poll every %ds, fx refresh every %s, market-ctx refresh every %s",
+		int(currentPollInterval().Seconds()), currentFxInterval(), currentMarketCtxInterval())
 }
 
 // currentPollInterval reads the quote polling cadence (seconds) from settings,
@@ -168,6 +198,34 @@ func (s *Server) TriggerPollReset() {
 func (s *Server) TriggerFxReset() {
 	select {
 	case s.fxReset <- struct{}{}:
+	default:
+	}
+}
+
+// currentMarketCtxInterval reads the market-context cache lifetime (the
+// ai_market_context_ttl setting, seconds) and clamps it to a sane range so the
+// upstream warm-up is neither hammered nor starved.
+func currentMarketCtxInterval() time.Duration {
+	sec := 900
+	if v := settings.GetDefault("ai_market_context_ttl", "900"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n < 60 {
+				n = 60
+			}
+			if n > 86400 {
+				n = 86400
+			}
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// TriggerMarketCtxReset asks the scheduler to reload the market-context refresh
+// interval (and refresh once immediately). Non-blocking.
+func (s *Server) TriggerMarketCtxReset() {
+	select {
+	case s.marketCtxReset <- struct{}{}:
 	default:
 	}
 }

@@ -80,6 +80,12 @@ func Mode() string {
 	return mode
 }
 
+// HTTPClient exposes the shared real-source HTTP client (6s timeout,
+// ProxyFromEnvironment) so other packages can reuse the same proxy-aware client
+// for new upstream sources instead of spinning up their own transport. New
+// sources therefore inherit the sandbox egress proxy automatically.
+func HTTPClient() *http.Client { return httpc }
+
 func activeAssets() []Asset {
 	rows, err := store.Query(`SELECT id, category, symbol, sub_type, currency, provider FROM assets WHERE status='active' ORDER BY category`)
 	if err != nil {

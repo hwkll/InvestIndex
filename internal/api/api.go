@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"investhub/internal/ai"
 	"investhub/internal/alerts"
 	"investhub/internal/core"
 	"investhub/internal/cryptox"
@@ -82,8 +83,9 @@ type Server struct {
 	// Reset signals let settings changes hot-reload the scheduler's timers
 	// without restarting the process. Buffered (cap 1) so a trigger never blocks
 	// the caller and a pending signal is always delivered.
-	pollReset chan struct{}
-	fxReset   chan struct{}
+	pollReset      chan struct{}
+	fxReset        chan struct{}
+	marketCtxReset chan struct{}
 
 	// limiter is the per-IP token bucket for the global rate limit (F-11).
 	limiter *ipRateLimiter
@@ -92,11 +94,12 @@ type Server struct {
 // New builds a Server.
 func New() *Server {
 	return &Server{
-		fails:     map[string]*failInfo{},
-		stop:      make(chan struct{}),
-		pollReset: make(chan struct{}, 1),
-		fxReset:   make(chan struct{}, 1),
-		limiter:   newIPRateLimiter(rateLimitRPS, rateLimitBurst),
+		fails:          map[string]*failInfo{},
+		stop:           make(chan struct{}),
+		pollReset:      make(chan struct{}, 1),
+		fxReset:        make(chan struct{}, 1),
+		marketCtxReset: make(chan struct{}, 1),
+		limiter:        newIPRateLimiter(rateLimitRPS, rateLimitBurst),
 	}
 }
 
@@ -466,6 +469,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/ai/analyses", h(handleListAnalyses))
 		r.Get("/ai/analyses/{id}", h(handleGetAnalysis))
 		r.Delete("/ai/analyses/{id}", h(handleDeleteAnalysis))
+		r.Get("/ai/marketctx/status", h(func(req *http.Request) (any, error) { return ai.MarketContextStatus(), nil }))
 
 		// alerts
 		r.Get("/alerts", h(func(req *http.Request) (any, error) { return alerts.ListRules(), nil }))
